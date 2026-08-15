@@ -3,6 +3,7 @@ import 'package:firebase_core/firebase_core.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:firebase_database/firebase_database.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
+import 'package:audioplayers/audioplayers.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -145,6 +146,8 @@ class UsersListScreen extends StatefulWidget {
 class _UsersListScreenState extends State<UsersListScreen> {
   final currentUid = FirebaseAuth.instance.currentUser?.uid ?? '';
   final dbRef = FirebaseDatabase.instance.ref();
+  final AudioPlayer _ringPlayer = AudioPlayer();
+  bool _isRinging = false;
 
   @override
   void initState() {
@@ -152,13 +155,17 @@ class _UsersListScreenState extends State<UsersListScreen> {
     _listenForIncomingCalls();
   }
 
-  // Listen globally for any incoming call directed to this user
   void _listenForIncomingCalls() {
-    dbRef.child('calls').onChildAdded.listen((event) {
+    dbRef.child('calls').onChildAdded.listen((event) async {
       final data = event.snapshot.value as Map<dynamic, dynamic>?;
       if (data == null) return;
       if (data['calleeId'] == currentUid && data['status'] == 'ringing') {
         final callId = event.snapshot.key!;
+
+        _isRinging = true;
+        await _ringPlayer.setReleaseMode(ReleaseMode.loop);
+        await _ringPlayer.play(AssetSource('sounds/nokia.mp3'));
+
         if (mounted) {
           Navigator.push(
             context,
@@ -170,10 +177,23 @@ class _UsersListScreenState extends State<UsersListScreen> {
                 isCaller: false,
               ),
             ),
-          );
+          ).then((_) => _stopRingtone());
         }
       }
     });
+  }
+
+  void _stopRingtone() async {
+    if (_isRinging) {
+      await _ringPlayer.stop();
+      _isRinging = false;
+    }
+  }
+
+  @override
+  void dispose() {
+    _ringPlayer.dispose();
+    super.dispose();
   }
 
   @override
@@ -238,7 +258,9 @@ class _ChatScreenState extends State<ChatScreen> {
   final String currentUid = FirebaseAuth.instance.currentUser?.uid ?? '';
   final DatabaseReference _dbRef = FirebaseDatabase.instance.ref();
   final TextEditingController _msgController = TextEditingController();
+  final AudioPlayer _notifPlayer = AudioPlayer();
   late String chatId;
+  int _lastMessageCount = 0;
 
   @override
   void initState() {
@@ -246,6 +268,24 @@ class _ChatScreenState extends State<ChatScreen> {
     List<String> ids = [currentUid, widget.peerUid];
     ids.sort();
     chatId = '${ids[0]}_${ids[1]}';
+    _listenForNewMessages();
+  }
+
+  void _listenForNewMessages() {
+    _dbRef.child('chats').child(chatId).child('messages').onValue.listen((event) {
+      if (event.snapshot.value == null) return;
+      Map<dynamic, dynamic> map = event.snapshot.value as Map<dynamic, dynamic>;
+      int count = map.length;
+      if (_lastMessageCount != 0 && count > _lastMessageCount) {
+        List<dynamic> list = map.values.toList();
+        list.sort((a, b) => (a['timestamp'] ?? 0).compareTo(b['timestamp'] ?? 0));
+        var lastMsg = list.last;
+        if (lastMsg['sender'] != currentUid) {
+          _notifPlayer.play(AssetSource('sounds/iphone.mp3'));
+        }
+      }
+      _lastMessageCount = count;
+    });
   }
 
   void _sendMessage() {
@@ -260,7 +300,6 @@ class _ChatScreenState extends State<ChatScreen> {
     }
   }
 
-  // Start a call - creates a call entry that the peer listens for
   void _startCall(bool isVideo) async {
     final callRef = _dbRef.child('calls').push();
     await callRef.set({
@@ -291,6 +330,12 @@ class _ChatScreenState extends State<ChatScreen> {
     } else {
       return const Icon(Icons.check, size: 16, color: Colors.grey);
     }
+  }
+
+  @override
+  void dispose() {
+    _notifPlayer.dispose();
+    super.dispose();
   }
 
   @override
@@ -407,6 +452,7 @@ class _CallScreenState extends State<CallScreen> {
   final DatabaseReference _dbRef = FirebaseDatabase.instance.ref();
   final _localRenderer = RTCVideoRenderer();
   final _remoteRenderer = RTCVideoRenderer();
+  final AudioPlayer _outgoingRingPlayer = AudioPlayer();
   RTCPeerConnection? _peerConnection;
   MediaStream? _localStream;
   String _status = 'Connecting...';
@@ -421,6 +467,10 @@ class _CallScreenState extends State<CallScreen> {
   void initState() {
     super.initState();
     _setup();
+    if (widget.isCaller) {
+      _outgoingRingPlayer.setReleaseMode(ReleaseMode.loop);
+      _outgoingRingPlayer.play(AssetSource('sounds/nokia.mp3'));
+    }
   }
 
   Future<void> _setup() async {
@@ -429,9 +479,7 @@ class _CallScreenState extends State<CallScreen> {
 
     _localStream = await navigator.mediaDevices.getUserMedia({
       'audio': true,
-      'video': widget.isVideo
-          ? {'facingMode': 'user'}
-          : false,
+      'video': widget.isVideo ? {'facingMode': 'user'} : false,
     });
     _localRenderer.srcObject = _localStream;
 
@@ -444,6 +492,7 @@ class _CallScreenState extends State<CallScreen> {
     _peerConnection!.onTrack = (RTCTrackEvent event) {
       if (event.streams.isNotEmpty) {
         _remoteRenderer.srcObject = event.streams[0];
+        _outgoingRingPlayer.stop();
         setState(() => _status = 'Connected');
       }
     };
@@ -456,7 +505,6 @@ class _CallScreenState extends State<CallScreen> {
     };
 
     if (widget.isCaller) {
-      // Create offer
       RTCSessionDescription offer = await _peerConnection!.createOffer();
       await _peerConnection!.setLocalDescription(offer);
       await callRef.child('offer').set({
@@ -464,7 +512,6 @@ class _CallScreenState extends State<CallScreen> {
         'type': offer.type,
       });
 
-      // Listen for answer
       callRef.child('answer').onValue.listen((event) async {
         final data = event.snapshot.value as Map<dynamic, dynamic>?;
         if (data != null && _peerConnection!.getRemoteDescription() == null) {
@@ -474,7 +521,6 @@ class _CallScreenState extends State<CallScreen> {
         }
       });
 
-      // Listen for callee ICE candidates
       callRef.child('calleeCandidates').onChildAdded.listen((event) {
         final data = event.snapshot.value as Map<dynamic, dynamic>?;
         if (data != null) {
@@ -486,7 +532,6 @@ class _CallScreenState extends State<CallScreen> {
         }
       });
     } else {
-      // Callee: listen for offer, then answer
       callRef.child('offer').onValue.listen((event) async {
         final data = event.snapshot.value as Map<dynamic, dynamic>?;
         if (data != null && _peerConnection!.getRemoteDescription() == null) {
@@ -503,7 +548,6 @@ class _CallScreenState extends State<CallScreen> {
         }
       });
 
-      // Listen for caller ICE candidates
       callRef.child('callerCandidates').onChildAdded.listen((event) {
         final data = event.snapshot.value as Map<dynamic, dynamic>?;
         if (data != null) {
@@ -520,6 +564,7 @@ class _CallScreenState extends State<CallScreen> {
   }
 
   void _endCall() async {
+    await _outgoingRingPlayer.stop();
     await _dbRef.child('calls').child(widget.callId).remove();
     _localStream?.getTracks().forEach((track) => track.stop());
     await _peerConnection?.close();
@@ -530,6 +575,7 @@ class _CallScreenState extends State<CallScreen> {
   void dispose() {
     _localRenderer.dispose();
     _remoteRenderer.dispose();
+    _outgoingRingPlayer.dispose();
     _localStream?.getTracks().forEach((track) => track.stop());
     _peerConnection?.close();
     super.dispose();
@@ -543,7 +589,8 @@ class _CallScreenState extends State<CallScreen> {
         children: [
           if (widget.isVideo)
             Positioned.fill(
-              child: RTCVideoView(_remoteRenderer, objectFit: RTCVideoViewObjectFit.RTCVideoViewObjectFitCover),
+              child: RTCVideoView(_remoteRenderer,
+                  objectFit: RTCVideoViewObjectFit.RTCVideoViewObjectFitCover),
             )
           else
             Center(
