@@ -2,10 +2,6 @@ import 'package:flutter/material.dart';
 import 'package:firebase_core/firebase_core.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:firebase_database/firebase_database.dart';
-import 'package:flutter_webrtc/flutter_webrtc.dart';
-import 'package:file_picker/file_picker.dart';
-import 'dart:convert';
-import 'dart:typed_data';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -27,7 +23,7 @@ class MyApp extends StatelessWidget {
       ),
       home: FirebaseAuth.instance.currentUser == null
           ? const PhoneAuthScreen()
-          : const MainChatScreen(),
+          : const UsersListScreen(),
     );
   }
 }
@@ -51,7 +47,7 @@ class _PhoneAuthScreenState extends State<PhoneAuthScreen> {
       phoneNumber: _phoneController.text.trim(),
       verificationCompleted: (PhoneAuthCredential credential) async {
         await FirebaseAuth.instance.signInWithCredential(credential);
-        _navigateToChat();
+        _saveUserAndGo();
       },
       verificationFailed: (FirebaseAuthException e) {
         ScaffoldMessenger.of(context).showSnackBar(
@@ -76,13 +72,25 @@ class _PhoneAuthScreenState extends State<PhoneAuthScreen> {
       smsCode: _otpController.text.trim(),
     );
     await FirebaseAuth.instance.signInWithCredential(credential);
-    _navigateToChat();
+    _saveUserAndGo();
   }
 
-  void _navigateToChat() {
+  // Save user info to database so others can find them
+  void _saveUserAndGo() async {
+    final uid = FirebaseAuth.instance.currentUser!.uid;
+    final phone = FirebaseAuth.instance.currentUser!.phoneNumber ?? '';
+    final dbRef = FirebaseDatabase.instance.ref();
+    await dbRef.child('users').child(uid).set({
+      'uid': uid,
+      'phone': phone,
+    });
+    _navigateToUsersList();
+  }
+
+  void _navigateToUsersList() {
     Navigator.pushReplacement(
       context,
-      MaterialPageRoute(builder: (context) => const MainChatScreen()),
+      MaterialPageRoute(builder: (context) => const UsersListScreen()),
     );
   }
 
@@ -130,81 +138,89 @@ class _PhoneAuthScreenState extends State<PhoneAuthScreen> {
   }
 }
 
-// ---------------- Main Chat & Presence Screen ----------------
-class MainChatScreen extends StatefulWidget {
-  const MainChatScreen({super.key});
+// ---------------- Users List Screen ----------------
+class UsersListScreen extends StatelessWidget {
+  const UsersListScreen({super.key});
 
   @override
-  State<MainChatScreen> createState() => _MainChatScreenState();
+  Widget build(BuildContext context) {
+    final currentUid = FirebaseAuth.instance.currentUser?.uid ?? '';
+    final dbRef = FirebaseDatabase.instance.ref();
+
+    return Scaffold(
+      appBar: AppBar(title: const Text('Chats')),
+      body: StreamBuilder(
+        stream: dbRef.child('users').onValue,
+        builder: (context, AsyncSnapshot<DatabaseEvent> snapshot) {
+          if (!snapshot.hasData || snapshot.data!.snapshot.value == null) {
+            return const Center(child: Text('No users yet'));
+          }
+          Map<dynamic, dynamic> map =
+              snapshot.data!.snapshot.value as Map<dynamic, dynamic>;
+          List<Map<dynamic, dynamic>> users = map.values
+              .map((e) => e as Map<dynamic, dynamic>)
+              .where((u) => u['uid'] != currentUid)
+              .toList();
+
+          if (users.isEmpty) {
+            return const Center(child: Text('No other users yet'));
+          }
+
+          return ListView.builder(
+            itemCount: users.length,
+            itemBuilder: (context, index) {
+              final user = users[index];
+              return ListTile(
+                leading: const CircleAvatar(child: Icon(Icons.person)),
+                title: Text(user['phone'] ?? 'Unknown'),
+                onTap: () {
+                  Navigator.push(
+                    context,
+                    MaterialPageRoute(
+                      builder: (context) => ChatScreen(
+                        peerUid: user['uid'],
+                        peerName: user['phone'] ?? 'Unknown',
+                      ),
+                    ),
+                  );
+                },
+              );
+            },
+          );
+        },
+      ),
+    );
+  }
 }
 
-class _MainChatScreenState extends State<MainChatScreen> {
-  final String currentUid = FirebaseAuth.instance.currentUser?.uid ?? "user_1";
+// ---------------- Private Chat Screen ----------------
+class ChatScreen extends StatefulWidget {
+  final String peerUid;
+  final String peerName;
+  const ChatScreen({super.key, required this.peerUid, required this.peerName});
+
+  @override
+  State<ChatScreen> createState() => _ChatScreenState();
+}
+
+class _ChatScreenState extends State<ChatScreen> {
+  final String currentUid = FirebaseAuth.instance.currentUser?.uid ?? '';
   final DatabaseReference _dbRef = FirebaseDatabase.instance.ref();
   final TextEditingController _msgController = TextEditingController();
-
-  RTCDataChannel? _dataChannel;
-  RTCPeerConnection? _peerConnection;
+  late String chatId;
 
   @override
   void initState() {
     super.initState();
-    _setupPresence();
-    _initWebRTC();
+    // Generate a consistent chat ID for both users (same regardless of who opens it)
+    List<String> ids = [currentUid, widget.peerUid];
+    ids.sort();
+    chatId = '${ids[0]}_${ids[1]}';
   }
 
-  // Handle Online / Offline Presence
-  void _setupPresence() {
-    final userPresenceRef = _dbRef.child("presence/$currentUid");
-    userPresenceRef.set({
-      'status': 'online',
-      'last_seen': ServerValue.timestamp,
-    });
-    userPresenceRef.onDisconnect().set({
-      'status': 'offline',
-      'last_seen': ServerValue.timestamp,
-    });
-  }
-
-  // WebRTC Setup for P2P Files & Calls
-  void _initWebRTC() async {
-    Map<String, dynamic> configuration = {
-      "iceServers": [
-        {"urls": "stun:stun.l.google.com:19302"}
-      ]
-    };
-
-    _peerConnection = await createPeerConnection(configuration);
-
-    RTCDataChannelInit dataChannelDict = RTCDataChannelInit();
-    _dataChannel = await _peerConnection!.createDataChannel("p2pDataChannel", dataChannelDict);
-
-    _dataChannel!.onDataChannelState = (RTCDataChannelState state) {
-      debugPrint("Data Channel State: $state");
-    };
-
-    _dataChannel!.onMessage = (RTCDataChannelMessage data) {
-      debugPrint("Received P2P Message/Media");
-    };
-  }
-
-  // P2P Media Sender (Zero Cloud Storage)
-  void _pickAndSendP2PFile() async {
-    FilePickerResult? result = await FilePicker.platform.pickFiles();
-    if (result != null && result.files.single.bytes != null) {
-      Uint8List fileBytes = result.files.single.bytes!;
-      String base64File = base64Encode(fileBytes);
-
-      if (_dataChannel != null && _dataChannel!.state == RTCDataChannelState.RTCDataChannelOpen) {
-        _dataChannel!.send(RTCDataChannelMessage(base64File));
-      }
-    }
-  }
-
-  // Send Message with Ticks logic
   void _sendMessage() {
     if (_msgController.text.trim().isNotEmpty) {
-      _dbRef.child("messages").push().set({
+      _dbRef.child('chats').child(chatId).child('messages').push().set({
         'sender': currentUid,
         'text': _msgController.text.trim(),
         'timestamp': DateTime.now().millisecondsSinceEpoch,
@@ -227,40 +243,53 @@ class _MainChatScreenState extends State<MainChatScreen> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(
-        title: const Text('P2P Direct Chat'),
-        actions: [
-          IconButton(
-            icon: const Icon(Icons.call),
-            onPressed: () {},
-          ),
-          IconButton(
-            icon: const Icon(Icons.videocam),
-            onPressed: () {},
-          ),
-        ],
-      ),
+      appBar: AppBar(title: Text(widget.peerName)),
       body: Column(
         children: [
           Expanded(
             child: StreamBuilder(
-              stream: _dbRef.child("messages").onValue,
+              stream: _dbRef.child('chats').child(chatId).child('messages').onValue,
               builder: (context, AsyncSnapshot<DatabaseEvent> snapshot) {
                 if (snapshot.hasData && snapshot.data!.snapshot.value != null) {
-                  Map<dynamic, dynamic> map = snapshot.data!.snapshot.value as Map<dynamic, dynamic>;
+                  Map<dynamic, dynamic> map =
+                      snapshot.data!.snapshot.value as Map<dynamic, dynamic>;
                   List<dynamic> list = map.values.toList();
+                  list.sort((a, b) =>
+                      (a['timestamp'] ?? 0).compareTo(b['timestamp'] ?? 0));
                   return ListView.builder(
                     itemCount: list.length,
                     itemBuilder: (context, index) {
                       var item = list[index];
-                      return ListTile(
-                        title: Text(item['text'] ?? ''),
-                        trailing: _buildTickIcon(item['status'] ?? 'sent'),
+                      bool isMe = item['sender'] == currentUid;
+                      return Align(
+                        alignment:
+                            isMe ? Alignment.centerRight : Alignment.centerLeft,
+                        child: Container(
+                          margin: const EdgeInsets.symmetric(
+                              horizontal: 8, vertical: 4),
+                          padding: const EdgeInsets.all(10),
+                          decoration: BoxDecoration(
+                            color: isMe
+                                ? Colors.teal.shade100
+                                : Colors.grey.shade300,
+                            borderRadius: BorderRadius.circular(10),
+                          ),
+                          child: Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              Flexible(child: Text(item['text'] ?? '')),
+                              if (isMe) ...[
+                                const SizedBox(width: 4),
+                                _buildTickIcon(item['status'] ?? 'sent'),
+                              ],
+                            ],
+                          ),
+                        ),
                       );
                     },
                   );
                 }
-                return const Center(child: Text('No Messages Yet'));
+                return const Center(child: Text('Say Hi 👋'));
               },
             ),
           ),
@@ -268,10 +297,6 @@ class _MainChatScreenState extends State<MainChatScreen> {
             padding: const EdgeInsets.all(8.0),
             child: Row(
               children: [
-                IconButton(
-                  icon: const Icon(Icons.attach_file),
-                  onPressed: _pickAndSendP2PFile,
-                ),
                 Expanded(
                   child: TextField(
                     controller: _msgController,
