@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:firebase_core/firebase_core.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:firebase_database/firebase_database.dart';
+import 'package:flutter_webrtc/flutter_webrtc.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -75,7 +76,6 @@ class _PhoneAuthScreenState extends State<PhoneAuthScreen> {
     _saveUserAndGo();
   }
 
-  // Save user info to database so others can find them
   void _saveUserAndGo() async {
     final uid = FirebaseAuth.instance.currentUser!.uid;
     final phone = FirebaseAuth.instance.currentUser!.phoneNumber ?? '';
@@ -84,10 +84,6 @@ class _PhoneAuthScreenState extends State<PhoneAuthScreen> {
       'uid': uid,
       'phone': phone,
     });
-    _navigateToUsersList();
-  }
-
-  void _navigateToUsersList() {
     Navigator.pushReplacement(
       context,
       MaterialPageRoute(builder: (context) => const UsersListScreen()),
@@ -139,14 +135,49 @@ class _PhoneAuthScreenState extends State<PhoneAuthScreen> {
 }
 
 // ---------------- Users List Screen ----------------
-class UsersListScreen extends StatelessWidget {
+class UsersListScreen extends StatefulWidget {
   const UsersListScreen({super.key});
 
   @override
-  Widget build(BuildContext context) {
-    final currentUid = FirebaseAuth.instance.currentUser?.uid ?? '';
-    final dbRef = FirebaseDatabase.instance.ref();
+  State<UsersListScreen> createState() => _UsersListScreenState();
+}
 
+class _UsersListScreenState extends State<UsersListScreen> {
+  final currentUid = FirebaseAuth.instance.currentUser?.uid ?? '';
+  final dbRef = FirebaseDatabase.instance.ref();
+
+  @override
+  void initState() {
+    super.initState();
+    _listenForIncomingCalls();
+  }
+
+  // Listen globally for any incoming call directed to this user
+  void _listenForIncomingCalls() {
+    dbRef.child('calls').onChildAdded.listen((event) {
+      final data = event.snapshot.value as Map<dynamic, dynamic>?;
+      if (data == null) return;
+      if (data['calleeId'] == currentUid && data['status'] == 'ringing') {
+        final callId = event.snapshot.key!;
+        if (mounted) {
+          Navigator.push(
+            context,
+            MaterialPageRoute(
+              builder: (context) => CallScreen(
+                callId: callId,
+                peerUid: data['callerId'],
+                isVideo: data['isVideo'] ?? false,
+                isCaller: false,
+              ),
+            ),
+          );
+        }
+      }
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(title: const Text('Chats')),
       body: StreamBuilder(
@@ -212,7 +243,6 @@ class _ChatScreenState extends State<ChatScreen> {
   @override
   void initState() {
     super.initState();
-    // Generate a consistent chat ID for both users (same regardless of who opens it)
     List<String> ids = [currentUid, widget.peerUid];
     ids.sort();
     chatId = '${ids[0]}_${ids[1]}';
@@ -230,6 +260,29 @@ class _ChatScreenState extends State<ChatScreen> {
     }
   }
 
+  // Start a call - creates a call entry that the peer listens for
+  void _startCall(bool isVideo) async {
+    final callRef = _dbRef.child('calls').push();
+    await callRef.set({
+      'callerId': currentUid,
+      'calleeId': widget.peerUid,
+      'isVideo': isVideo,
+      'status': 'ringing',
+    });
+    if (!mounted) return;
+    Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (context) => CallScreen(
+          callId: callRef.key!,
+          peerUid: widget.peerUid,
+          isVideo: isVideo,
+          isCaller: true,
+        ),
+      ),
+    );
+  }
+
   Widget _buildTickIcon(String status) {
     if (status == 'seen') {
       return const Icon(Icons.done_all, size: 16, color: Colors.blue);
@@ -243,7 +296,19 @@ class _ChatScreenState extends State<ChatScreen> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: Text(widget.peerName)),
+      appBar: AppBar(
+        title: Text(widget.peerName),
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.call),
+            onPressed: () => _startCall(false),
+          ),
+          IconButton(
+            icon: const Icon(Icons.videocam),
+            onPressed: () => _startCall(true),
+          ),
+        ],
+      ),
       body: Column(
         children: [
           Expanded(
@@ -311,6 +376,200 @@ class _ChatScreenState extends State<ChatScreen> {
                   onPressed: _sendMessage,
                 ),
               ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+// ---------------- Call Screen (Audio + Video) ----------------
+class CallScreen extends StatefulWidget {
+  final String callId;
+  final String peerUid;
+  final bool isVideo;
+  final bool isCaller;
+
+  const CallScreen({
+    super.key,
+    required this.callId,
+    required this.peerUid,
+    required this.isVideo,
+    required this.isCaller,
+  });
+
+  @override
+  State<CallScreen> createState() => _CallScreenState();
+}
+
+class _CallScreenState extends State<CallScreen> {
+  final DatabaseReference _dbRef = FirebaseDatabase.instance.ref();
+  final _localRenderer = RTCVideoRenderer();
+  final _remoteRenderer = RTCVideoRenderer();
+  RTCPeerConnection? _peerConnection;
+  MediaStream? _localStream;
+  String _status = 'Connecting...';
+
+  final Map<String, dynamic> _config = {
+    'iceServers': [
+      {'urls': 'stun:stun.l.google.com:19302'},
+    ]
+  };
+
+  @override
+  void initState() {
+    super.initState();
+    _setup();
+  }
+
+  Future<void> _setup() async {
+    await _localRenderer.initialize();
+    await _remoteRenderer.initialize();
+
+    _localStream = await navigator.mediaDevices.getUserMedia({
+      'audio': true,
+      'video': widget.isVideo
+          ? {'facingMode': 'user'}
+          : false,
+    });
+    _localRenderer.srcObject = _localStream;
+
+    _peerConnection = await createPeerConnection(_config);
+
+    for (var track in _localStream!.getTracks()) {
+      await _peerConnection!.addTrack(track, _localStream!);
+    }
+
+    _peerConnection!.onTrack = (RTCTrackEvent event) {
+      if (event.streams.isNotEmpty) {
+        _remoteRenderer.srcObject = event.streams[0];
+        setState(() => _status = 'Connected');
+      }
+    };
+
+    final callRef = _dbRef.child('calls').child(widget.callId);
+
+    _peerConnection!.onIceCandidate = (RTCIceCandidate candidate) {
+      final path = widget.isCaller ? 'callerCandidates' : 'calleeCandidates';
+      callRef.child(path).push().set(candidate.toMap());
+    };
+
+    if (widget.isCaller) {
+      // Create offer
+      RTCSessionDescription offer = await _peerConnection!.createOffer();
+      await _peerConnection!.setLocalDescription(offer);
+      await callRef.child('offer').set({
+        'sdp': offer.sdp,
+        'type': offer.type,
+      });
+
+      // Listen for answer
+      callRef.child('answer').onValue.listen((event) async {
+        final data = event.snapshot.value as Map<dynamic, dynamic>?;
+        if (data != null && _peerConnection!.getRemoteDescription() == null) {
+          RTCSessionDescription answer =
+              RTCSessionDescription(data['sdp'], data['type']);
+          await _peerConnection!.setRemoteDescription(answer);
+        }
+      });
+
+      // Listen for callee ICE candidates
+      callRef.child('calleeCandidates').onChildAdded.listen((event) {
+        final data = event.snapshot.value as Map<dynamic, dynamic>?;
+        if (data != null) {
+          _peerConnection!.addCandidate(RTCIceCandidate(
+            data['candidate'],
+            data['sdpMid'],
+            data['sdpMLineIndex'],
+          ));
+        }
+      });
+    } else {
+      // Callee: listen for offer, then answer
+      callRef.child('offer').onValue.listen((event) async {
+        final data = event.snapshot.value as Map<dynamic, dynamic>?;
+        if (data != null && _peerConnection!.getRemoteDescription() == null) {
+          RTCSessionDescription offer =
+              RTCSessionDescription(data['sdp'], data['type']);
+          await _peerConnection!.setRemoteDescription(offer);
+
+          RTCSessionDescription answer = await _peerConnection!.createAnswer();
+          await _peerConnection!.setLocalDescription(answer);
+          await callRef.child('answer').set({
+            'sdp': answer.sdp,
+            'type': answer.type,
+          });
+        }
+      });
+
+      // Listen for caller ICE candidates
+      callRef.child('callerCandidates').onChildAdded.listen((event) {
+        final data = event.snapshot.value as Map<dynamic, dynamic>?;
+        if (data != null) {
+          _peerConnection!.addCandidate(RTCIceCandidate(
+            data['candidate'],
+            data['sdpMid'],
+            data['sdpMLineIndex'],
+          ));
+        }
+      });
+    }
+
+    await callRef.child('status').set('active');
+  }
+
+  void _endCall() async {
+    await _dbRef.child('calls').child(widget.callId).remove();
+    _localStream?.getTracks().forEach((track) => track.stop());
+    await _peerConnection?.close();
+    if (mounted) Navigator.pop(context);
+  }
+
+  @override
+  void dispose() {
+    _localRenderer.dispose();
+    _remoteRenderer.dispose();
+    _localStream?.getTracks().forEach((track) => track.stop());
+    _peerConnection?.close();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: Colors.black,
+      body: Stack(
+        children: [
+          if (widget.isVideo)
+            Positioned.fill(
+              child: RTCVideoView(_remoteRenderer, objectFit: RTCVideoViewObjectFit.RTCVideoViewObjectFitCover),
+            )
+          else
+            Center(
+              child: Text(
+                _status,
+                style: const TextStyle(color: Colors.white, fontSize: 20),
+              ),
+            ),
+          if (widget.isVideo)
+            Positioned(
+              top: 40,
+              right: 20,
+              width: 100,
+              height: 150,
+              child: RTCVideoView(_localRenderer, mirror: true),
+            ),
+          Positioned(
+            bottom: 40,
+            left: 0,
+            right: 0,
+            child: Center(
+              child: FloatingActionButton(
+                backgroundColor: Colors.red,
+                onPressed: _endCall,
+                child: const Icon(Icons.call_end),
+              ),
             ),
           ),
         ],
