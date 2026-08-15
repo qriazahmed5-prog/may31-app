@@ -24,13 +24,10 @@ jobs:
           flutter-version: '3.19.6'
           channel: 'stable'
 
-      - name: Recreate Clean Android V2 Structure
+      - name: Clean and Get Dependencies
         run: |
-          rm -rf android
-          flutter create . --platforms=android
-
-      - name: Install Dependencies
-        run: flutter pub get
+          flutter clean
+          flutter pub get
 
       - name: Build APK
         run: flutter build apk --release --no-tree-shake-icons
