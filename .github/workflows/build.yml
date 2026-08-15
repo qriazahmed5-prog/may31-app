@@ -24,8 +24,23 @@ jobs:
           flutter-version: '3.19.6'
           channel: 'stable'
 
-      - name: Clean
-        run: flutter clean
+      - name: Backup google-services.json
+        run: |
+          mkdir -p /tmp/backup
+          cp android/app/google-services.json /tmp/backup/google-services.json
+
+      - name: Regenerate Android project (v2 embedding)
+        run: |
+          flutter clean
+          rm -rf android
+          flutter create . --platforms=android --org com.example
+
+      - name: Restore google-services.json
+        run: cp /tmp/backup/google-services.json android/app/google-services.json
+
+      - name: Add required permissions
+        run: |
+          sed -i 's#<application#<uses-permission android:name="android.permission.CAMERA"/>\n    <uses-permission android:name="android.permission.RECORD_AUDIO"/>\n    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS"/>\n\n    <application#' android/app/src/main/AndroidManifest.xml
 
       - name: Install Dependencies
         run: flutter pub get
