@@ -24,6 +24,17 @@ jobs:
           flutter-version: '3.19.6'
           channel: 'stable'
 
+      - name: Force Clean V2 Embedding Files
+        run: |
+          rm -rf android/app/src/main/kotlin
+          mkdir -p android/app/src/main/kotlin/com/example/may31
+          echo 'package com.example.may31
+
+          import io.flutter.embedding.android.FlutterActivity
+
+          class MainActivity: FlutterActivity() {
+          }' > android/app/src/main/kotlin/com/example/may31/MainActivity.kt
+
       - name: Install Dependencies
         run: flutter pub get
 
