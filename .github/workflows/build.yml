@@ -24,8 +24,9 @@ jobs:
           flutter-version: '3.19.6'
           channel: 'stable'
 
-      - name: Force Fix V2 Embedding & Manifest First
+      - name: Create V2 Embedding Structure Manually
         run: |
+          rm -rf android/app/src/main/kotlin
           mkdir -p android/app/src/main/kotlin/com/example/may31
           echo 'package com.example.may31
 
