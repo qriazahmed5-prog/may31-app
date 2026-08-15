@@ -24,7 +24,7 @@ jobs:
           flutter-version: '3.19.6'
           channel: 'stable'
 
-      - name: Force Fix V2 Embedding & Manifest
+      - name: Force Fix V2 Embedding & Manifest First
         run: |
           mkdir -p android/app/src/main/kotlin/com/example/may31
           echo 'package com.example.may31
