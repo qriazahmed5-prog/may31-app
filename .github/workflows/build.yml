@@ -33,8 +33,7 @@ jobs:
         run: |
           flutter clean
           rm -rf android
-          flutter create . --platforms=android --org com.example
-
+          flutter create . --platforms=android --org com.example --project-name may31
       - name: Restore google-services.json
         run: cp /tmp/backup/google-services.json android/app/google-services.json
 
