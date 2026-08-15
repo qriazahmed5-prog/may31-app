@@ -34,6 +34,11 @@ jobs:
           flutter clean
           rm -rf android
           flutter create . --platforms=android --org com.example --project-name may31
+
+      - name: Set minSdkVersion to 23
+        run: |
+          sed -i 's/minSdkVersion flutter.minSdkVersion/minSdkVersion 23/' android/app/build.gradle
+
       - name: Restore google-services.json
         run: cp /tmp/backup/google-services.json android/app/google-services.json
 
