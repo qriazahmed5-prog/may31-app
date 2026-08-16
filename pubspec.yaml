@@ -21,6 +21,7 @@ dependencies:
   path_provider: ^2.1.1
   record: ^4.4.4
   flutter_contacts: ^1.1.9+2
+  emoji_picker_flutter: ^1.6.3
 
 dev_dependencies:
   flutter_test:
