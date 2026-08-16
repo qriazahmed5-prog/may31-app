@@ -11,8 +11,6 @@ import 'package:permission_handler/permission_handler.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:path_provider/path_provider.dart';
-import 'package:video_player/video_player.dart';
-import 'package:gal/gal.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -580,36 +578,6 @@ class _ChatScreenState extends State<ChatScreen> {
     );
   }
 
-  Future<void> _saveToGallery(String type, String localPath, String fileName) async {
-    try {
-      bool granted = await Gal.requestAccess();
-      if (!granted) {
-        if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(content: Text('Gallery permission denied')),
-          );
-        }
-        return;
-      }
-      if (type == 'image') {
-        await Gal.putImage(localPath, album: 'P2P Media Chat');
-      } else if (type == 'video') {
-        await Gal.putVideo(localPath, album: 'P2P Media Chat');
-      }
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('Saved to Gallery')),
-        );
-      }
-    } catch (e) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Failed to save: $e')),
-        );
-      }
-    }
-  }
-
   void _sendMessage() {
     if (_msgController.text.trim().isNotEmpty) {
       _dbRef.child('chats').child(chatId).child('messages').push().set({
@@ -662,107 +630,38 @@ class _ChatScreenState extends State<ChatScreen> {
     }
 
     String? localPath = _localFilePaths[item['fileId']];
-    String fileName = item['fileName'] ?? 'File';
 
     if (type == 'image') {
-      if (localPath == null) {
-        return Row(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            const Icon(Icons.image, size: 20),
-            const SizedBox(width: 4),
-            Flexible(
-              child: Text('$fileName (receiving...)', overflow: TextOverflow.ellipsis),
-            ),
-          ],
+      if (localPath != null) {
+        return ClipRRect(
+          borderRadius: BorderRadius.circular(8),
+          child: Image.file(File(localPath), width: 180, fit: BoxFit.cover),
         );
       }
-      return Stack(
+      return Row(
+        mainAxisSize: MainAxisSize.min,
         children: [
-          ClipRRect(
-            borderRadius: BorderRadius.circular(8),
-            child: Image.file(File(localPath), width: 180, fit: BoxFit.cover),
-          ),
-          Positioned(
-            right: 2,
-            bottom: 2,
-            child: GestureDetector(
-              onTap: () => _saveToGallery('image', localPath, fileName),
-              child: Container(
-                padding: const EdgeInsets.all(4),
-                decoration: BoxDecoration(
-                  color: Colors.black54,
-                  borderRadius: BorderRadius.circular(20),
-                ),
-                child: const Icon(Icons.download, color: Colors.white, size: 16),
-              ),
-            ),
+          const Icon(Icons.image, size: 20),
+          const SizedBox(width: 4),
+          Flexible(
+            child: Text(item['fileName'] ?? 'Image (receiving...)',
+                overflow: TextOverflow.ellipsis),
           ),
         ],
       );
     }
 
-    if (type == 'video') {
-      if (localPath == null) {
-        return Row(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            const Icon(Icons.videocam, size: 20),
-            const SizedBox(width: 4),
-            Flexible(
-              child: Text('$fileName (receiving...)', overflow: TextOverflow.ellipsis),
-            ),
-          ],
-        );
-      }
-      return GestureDetector(
-        onTap: () {
-          Navigator.push(
-            context,
-            MaterialPageRoute(builder: (_) => VideoPlayerPage(filePath: localPath)),
-          );
-        },
-        child: Stack(
-          alignment: Alignment.center,
-          children: [
-            Container(
-              width: 180,
-              height: 120,
-              decoration: BoxDecoration(
-                color: Colors.black87,
-                borderRadius: BorderRadius.circular(8),
-              ),
-              child: const Icon(Icons.play_circle_fill, color: Colors.white, size: 48),
-            ),
-            Positioned(
-              right: 6,
-              bottom: 6,
-              child: GestureDetector(
-                onTap: () => _saveToGallery('video', localPath, fileName),
-                child: Container(
-                  padding: const EdgeInsets.all(4),
-                  decoration: BoxDecoration(
-                    color: Colors.black54,
-                    borderRadius: BorderRadius.circular(20),
-                  ),
-                  child: const Icon(Icons.download, color: Colors.white, size: 16),
-                ),
-              ),
-            ),
-          ],
-        ),
-      );
-    }
-
-    // Document / any other file
+    IconData icon = type == 'video' ? Icons.videocam : Icons.insert_drive_file;
     return Row(
       mainAxisSize: MainAxisSize.min,
       children: [
-        Icon(localPath != null ? Icons.insert_drive_file : Icons.hourglass_bottom, size: 20),
+        Icon(localPath != null ? icon : Icons.hourglass_bottom, size: 20),
         const SizedBox(width: 4),
         Flexible(
           child: Text(
-            localPath != null ? fileName : '$fileName (receiving...)',
+            localPath != null
+                ? (item['fileName'] ?? 'File')
+                : '${item['fileName'] ?? 'File'} (receiving...)',
             overflow: TextOverflow.ellipsis,
           ),
         ),
@@ -880,70 +779,6 @@ class _ChatScreenState extends State<ChatScreen> {
           ),
         ],
       ),
-    );
-  }
-}
-
-// ---------------- Inline Video Player Page ----------------
-class VideoPlayerPage extends StatefulWidget {
-  final String filePath;
-  const VideoPlayerPage({super.key, required this.filePath});
-
-  @override
-  State<VideoPlayerPage> createState() => _VideoPlayerPageState();
-}
-
-class _VideoPlayerPageState extends State<VideoPlayerPage> {
-  late VideoPlayerController _controller;
-  bool _initialized = false;
-
-  @override
-  void initState() {
-    super.initState();
-    _controller = VideoPlayerController.file(File(widget.filePath))
-      ..initialize().then((_) {
-        if (mounted) {
-          setState(() => _initialized = true);
-          _controller.play();
-        }
-      });
-  }
-
-  @override
-  void dispose() {
-    _controller.dispose();
-    super.dispose();
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return Scaffold(
-      backgroundColor: Colors.black,
-      appBar: AppBar(
-        backgroundColor: Colors.black,
-        foregroundColor: Colors.white,
-      ),
-      body: Center(
-        child: _initialized
-            ? AspectRatio(
-                aspectRatio: _controller.value.aspectRatio,
-                child: VideoPlayer(_controller),
-              )
-            : const CircularProgressIndicator(),
-      ),
-      floatingActionButton: _initialized
-          ? FloatingActionButton(
-              onPressed: () {
-                setState(() {
-                  _controller.value.isPlaying
-                      ? _controller.pause()
-                      : _controller.play();
-                });
-              },
-              child: Icon(
-                  _controller.value.isPlaying ? Icons.pause : Icons.play_arrow),
-            )
-          : null,
     );
   }
 }
