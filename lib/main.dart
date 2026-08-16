@@ -11,6 +11,7 @@ import 'package:permission_handler/permission_handler.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:path_provider/path_provider.dart';
+import 'package:record/record.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -255,6 +256,77 @@ class _UsersListScreenState extends State<UsersListScreen> {
   }
 }
 
+// ---------------- Voice Message Bubble Widget ----------------
+class VoiceMessageBubble extends StatefulWidget {
+  final String filePath;
+  const VoiceMessageBubble({super.key, required this.filePath});
+
+  @override
+  State<VoiceMessageBubble> createState() => _VoiceMessageBubbleState();
+}
+
+class _VoiceMessageBubbleState extends State<VoiceMessageBubble> {
+  final AudioPlayer _player = AudioPlayer();
+  bool _isPlaying = false;
+  Duration _duration = Duration.zero;
+  Duration _position = Duration.zero;
+
+  @override
+  void initState() {
+    super.initState();
+    _player.onDurationChanged.listen((d) {
+      if (mounted) setState(() => _duration = d);
+    });
+    _player.onPositionChanged.listen((p) {
+      if (mounted) setState(() => _position = p);
+    });
+    _player.onPlayerComplete.listen((_) {
+      if (mounted) setState(() => _isPlaying = false);
+    });
+  }
+
+  void _togglePlay() async {
+    if (_isPlaying) {
+      await _player.pause();
+      setState(() => _isPlaying = false);
+    } else {
+      await _player.play(DeviceFileSource(widget.filePath));
+      setState(() => _isPlaying = true);
+    }
+  }
+
+  String _fmt(Duration d) {
+    String twoDigits(int n) => n.toString().padLeft(2, '0');
+    return '${twoDigits(d.inMinutes)}:${twoDigits(d.inSeconds % 60)}';
+  }
+
+  @override
+  void dispose() {
+    _player.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        IconButton(
+          icon: Icon(_isPlaying ? Icons.pause_circle : Icons.play_circle,
+              size: 32, color: Colors.teal),
+          onPressed: _togglePlay,
+        ),
+        Text(
+          _duration.inMilliseconds > 0
+              ? '${_fmt(_position)} / ${_fmt(_duration)}'
+              : 'Voice message',
+          style: const TextStyle(fontSize: 12),
+        ),
+      ],
+    );
+  }
+}
+
 // ---------------- Private Chat Screen ----------------
 class ChatScreen extends StatefulWidget {
   final String peerUid;
@@ -280,6 +352,11 @@ class _ChatScreenState extends State<ChatScreen> {
   final Map<String, List<Uint8List?>> _recvChunks = {};
   final Map<String, Map<String, dynamic>> _recvMeta = {};
   final Map<String, String> _localFilePaths = {};
+
+  // ---- Voice recording ----
+  final AudioRecorder _audioRecorder = AudioRecorder();
+  bool _isRecording = false;
+  String? _recordingPath;
 
   @override
   void initState() {
@@ -455,7 +532,9 @@ class _ChatScreenState extends State<ChatScreen> {
         ? 'image'
         : mime.startsWith('video/')
             ? 'video'
-            : 'file';
+            : mime.startsWith('audio/')
+                ? 'voice'
+                : 'file';
 
     _fileChannel!.send(RTCDataChannelMessage(jsonEncode({
       't': 'meta',
@@ -578,6 +657,41 @@ class _ChatScreenState extends State<ChatScreen> {
     );
   }
 
+  // -------- Voice recording --------
+  void _startRecording() async {
+    bool hasPermission = await _audioRecorder.hasPermission();
+    if (!hasPermission) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Microphone permission denied')),
+      );
+      return;
+    }
+    final dir = await getApplicationDocumentsDirectory();
+    final path =
+        '${dir.path}/voice_${DateTime.now().millisecondsSinceEpoch}.m4a';
+    await _audioRecorder.start(const RecordConfig(), path: path);
+    setState(() {
+      _isRecording = true;
+      _recordingPath = path;
+    });
+  }
+
+  void _stopAndSendRecording() async {
+    final path = await _audioRecorder.stop();
+    setState(() => _isRecording = false);
+    if (path == null) return;
+    final file = File(path);
+    if (!await file.exists()) return;
+    final bytes = await file.readAsBytes();
+    final fileName = 'voice_${DateTime.now().millisecondsSinceEpoch}.m4a';
+    await _sendFileBytes(bytes, fileName, 'audio/m4a');
+  }
+
+  void _cancelRecording() async {
+    await _audioRecorder.stop();
+    setState(() => _isRecording = false);
+  }
+
   void _sendMessage() {
     if (_msgController.text.trim().isNotEmpty) {
       _dbRef.child('chats').child(chatId).child('messages').push().set({
@@ -631,6 +745,20 @@ class _ChatScreenState extends State<ChatScreen> {
 
     String? localPath = _localFilePaths[item['fileId']];
 
+    if (type == 'voice') {
+      if (localPath == null) {
+        return const Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(Icons.mic, size: 20),
+            SizedBox(width: 4),
+            Text('Voice message (receiving...)'),
+          ],
+        );
+      }
+      return VoiceMessageBubble(filePath: localPath);
+    }
+
     if (type == 'image') {
       if (localPath != null) {
         return ClipRRect(
@@ -674,6 +802,7 @@ class _ChatScreenState extends State<ChatScreen> {
     _notifPlayer.dispose();
     _fileChannel?.close();
     _fileConn?.close();
+    _audioRecorder.dispose();
     super.dispose();
   }
 
@@ -770,6 +899,18 @@ class _ChatScreenState extends State<ChatScreen> {
                     ),
                   ),
                 ),
+                if (_msgController.text.trim().isEmpty)
+                  GestureDetector(
+                    onLongPress: _startRecording,
+                    onLongPressUp: _stopAndSendRecording,
+                    child: IconButton(
+                      icon: Icon(
+                        _isRecording ? Icons.mic : Icons.mic_none,
+                        color: _isRecording ? Colors.red : null,
+                      ),
+                      onPressed: () {},
+                    ),
+                  ),
                 IconButton(
                   icon: const Icon(Icons.send),
                   onPressed: _sendMessage,
@@ -777,6 +918,24 @@ class _ChatScreenState extends State<ChatScreen> {
               ],
             ),
           ),
+          if (_isRecording)
+            Container(
+              width: double.infinity,
+              color: Colors.red.shade50,
+              padding: const EdgeInsets.symmetric(vertical: 6),
+              child: Row(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  const Icon(Icons.fiber_manual_record, color: Colors.red, size: 14),
+                  const SizedBox(width: 6),
+                  const Text('Recording... release mic to send'),
+                  TextButton(
+                    onPressed: _cancelRecording,
+                    child: const Text('Cancel'),
+                  ),
+                ],
+              ),
+            ),
         ],
       ),
     );
