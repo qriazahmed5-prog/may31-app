@@ -39,6 +39,12 @@ jobs:
         run: |
           sed -i 's/minSdkVersion flutter.minSdkVersion/minSdkVersion 23/' android/app/build.gradle
 
+      - name: Disable R8 minification
+        run: |
+          sed -i 's/signingConfig signingConfigs.debug/signingConfig signingConfigs.debug\n            minifyEnabled false\n            shrinkResources false/' android/app/build.gradle
+          echo "---- build.gradle after edit ----"
+          cat android/app/build.gradle
+
       - name: Restore google-services.json
         run: cp /tmp/backup/google-services.json android/app/google-services.json
 
