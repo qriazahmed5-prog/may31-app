@@ -669,7 +669,7 @@ class _ChatScreenState extends State<ChatScreen> {
     final dir = await getApplicationDocumentsDirectory();
     final path =
         '${dir.path}/voice_${DateTime.now().millisecondsSinceEpoch}.m4a';
-    await _audioRecorder.start(const RecordConfig(), path: path);
+    await _audioRecorder.start(path: path, encoder: AudioEncoder.aacLc);
     setState(() {
       _isRecording = true;
       _recordingPath = path;
