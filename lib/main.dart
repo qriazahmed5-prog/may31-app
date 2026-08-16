@@ -354,7 +354,7 @@ class _ChatScreenState extends State<ChatScreen> {
   final Map<String, String> _localFilePaths = {};
 
   // ---- Voice recording ----
-  final AudioRecorder _audioRecorder = AudioRecorder();
+  final Record _audioRecorder = Record();
   bool _isRecording = false;
   String? _recordingPath;
 
