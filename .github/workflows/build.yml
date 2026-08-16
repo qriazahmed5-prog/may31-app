@@ -24,18 +24,27 @@ jobs:
           flutter-version: '3.19.6'
           channel: 'stable'
 
-      - name: Nuke Old Android Folder and Create Fresh V2
+      - name: Backup google-services.json
         run: |
-          rm -rf android
-          flutter create . --platforms=android --project-name=may31
+          mkdir -p /tmp/backup
+          cp android/app/google-services.json /tmp/backup/google-services.json
 
-      - name: Fix SDK 35 in Build.gradle
+      - name: Regenerate Android project (v2 embedding)
         run: |
-          BUILD_FILE="android/app/build.gradle"
-          if [ -f "$BUILD_FILE" ]; then
-            sed -i -E 's/^([[:space:]]*)compileSdk(Version)?[[:space:]]*=?[[:space:]]*.*/\1compileSdk = 35/' "$BUILD_FILE"
-            sed -i -E 's/^([[:space:]]*)targetSdk(Version)?[[:space:]]*=?[[:space:]]*.*/\1targetSdk = 35/' "$BUILD_FILE"
-          fi
+          flutter clean
+          rm -rf android
+          flutter create . --platforms=android --org com.example --project-name may31
+
+      - name: Set minSdkVersion to 23
+        run: |
+          sed -i 's/minSdkVersion flutter.minSdkVersion/minSdkVersion 23/' android/app/build.gradle
+
+      - name: Restore google-services.json
+        run: cp /tmp/backup/google-services.json android/app/google-services.json
+
+      - name: Add required permissions
+        run: |
+          sed -i 's#<application#<uses-permission android:name="android.permission.CAMERA"/>\n    <uses-permission android:name="android.permission.RECORD_AUDIO"/>\n    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS"/>\n\n    <application#' android/app/src/main/AndroidManifest.xml
 
       - name: Install Dependencies
         run: flutter pub get
