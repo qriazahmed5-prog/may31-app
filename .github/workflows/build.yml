@@ -21,35 +21,24 @@ jobs:
       - name: Set up Flutter
         uses: subosito/flutter-action@v2
         with:
-          flutter-version: '3.24.5'
+          flutter-version: '3.19.6'
           channel: 'stable'
 
-      - name: Backup google-services.json
-        run: |
-          mkdir -p /tmp/backup
-          cp android/app/google-services.json /tmp/backup/google-services.json
-
-      - name: Regenerate Android project (v2 embedding)
+      - name: Clean and Regenerate V2 Android Project
         run: |
           flutter clean
           rm -rf android
-          flutter create . --platforms=android --org com.example --project-name may31
+          flutter create . --platforms=android
 
-      - name: Set SDK versions
+      - name: Fix Compile SDK to 35 for Packages
         run: |
-          cat android/app/build.gradle
-          sed -i -E 's/compileSdk(Version)?[[:space:]]*=?[[:space:]]*flutter\.compileSdkVersion/compileSdk 34/' android/app/build.gradle
-          sed -i -E 's/minSdk(Version)?[[:space:]]*=?[[:space:]]*flutter\.minSdkVersion/minSdk 23/' android/app/build.gradle
-          sed -i -E 's/targetSdk(Version)?[[:space:]]*=?[[:space:]]*flutter\.targetSdkVersion/targetSdk 34/' android/app/build.gradle
-          echo "---- After edit ----"
-          cat android/app/build.gradle
-
-      - name: Restore google-services.json
-        run: cp /tmp/backup/google-services.json android/app/google-services.json
-
-      - name: Add required permissions
-        run: |
-          sed -i 's#<application#<uses-permission android:name="android.permission.CAMERA"/>\n    <uses-permission android:name="android.permission.RECORD_AUDIO"/>\n    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS"/>\n    <uses-permission android:name="android.permission.READ_MEDIA_IMAGES"/>\n    <uses-permission android:name="android.permission.READ_MEDIA_VIDEO"/>\n    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="28"/>\n\n    <application#' android/app/src/main/AndroidManifest.xml
+          BUILD_FILE="android/app/build.gradle"
+          if [ -f "$BUILD_FILE" ]; then
+            sed -i 's/compileSdkVersion.*/compileSdkVersion 35/' "$BUILD_FILE"
+            sed -i 's/targetSdkVersion.*/targetSdkVersion 35/' "$BUILD_FILE"
+            sed -i 's/flutter.compileSdkVersion/35/' "$BUILD_FILE"
+            sed -i 's/flutter.targetSdkVersion/35/' "$BUILD_FILE"
+          fi
 
       - name: Install Dependencies
         run: flutter pub get
