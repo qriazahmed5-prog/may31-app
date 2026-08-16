@@ -24,13 +24,7 @@ jobs:
           flutter-version: '3.19.6'
           channel: 'stable'
 
-      - name: Clean and Regenerate V2 Android Project
-        run: |
-          flutter clean
-          rm -rf android
-          flutter create . --platforms=android
-
-      - name: Fix Compile SDK to 35 for Packages
+      - name: Fix SDK 35 in Local Build.gradle
         run: |
           BUILD_FILE="android/app/build.gradle"
           if [ -f "$BUILD_FILE" ]; then
