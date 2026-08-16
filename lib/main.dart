@@ -13,6 +13,7 @@ import 'package:image_picker/image_picker.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:record/record.dart';
 import 'package:flutter_contacts/flutter_contacts.dart';
+import 'package:emoji_picker_flutter/emoji_picker_flutter.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -408,6 +409,12 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   late String chatId;
   int _lastMessageCount = 0;
   bool _screenIsActive = true;
+  bool _showEmojiPicker = false;
+
+  // ---- Reply feature ----
+  String? _replyToId;
+  String? _replyToText;
+  String? _replyToSender;
 
   // ---- File sharing (P2P + chunking) ----
   RTCPeerConnection? _fileConn;
@@ -444,7 +451,6 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       Map<dynamic, dynamic> map = event.snapshot.value as Map<dynamic, dynamic>;
       int count = map.length;
 
-      // Play notification sound for new incoming messages
       if (_lastMessageCount != 0 && count > _lastMessageCount) {
         List<dynamic> list = map.values.toList();
         list.sort((a, b) => (a['timestamp'] ?? 0).compareTo(b['timestamp'] ?? 0));
@@ -455,13 +461,10 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       }
       _lastMessageCount = count;
 
-      // Mark peer's messages as delivered/seen
       _updateIncomingMessageStatuses(map);
     });
   }
 
-  // Any message sent BY the peer TO me: mark as delivered (received here)
-  // and as seen (since this screen is currently open and active)
   void _updateIncomingMessageStatuses(Map<dynamic, dynamic> map) {
     map.forEach((key, value) {
       final msg = value as Map<dynamic, dynamic>;
@@ -791,15 +794,43 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
 
   void _sendMessage() {
     if (_msgController.text.trim().isNotEmpty) {
-      _dbRef.child('chats').child(chatId).child('messages').push().set({
+      final msgData = {
         'sender': currentUid,
         'type': 'text',
         'text': _msgController.text.trim(),
         'timestamp': DateTime.now().millisecondsSinceEpoch,
         'status': 'sent',
-      });
+      };
+      if (_replyToId != null) {
+        msgData['replyToText'] = _replyToText ?? '';
+        msgData['replyToSender'] = _replyToSender ?? '';
+      }
+      _dbRef.child('chats').child(chatId).child('messages').push().set(msgData);
       _msgController.clear();
+      setState(() {
+        _replyToId = null;
+        _replyToText = null;
+        _replyToSender = null;
+      });
     }
+  }
+
+  void _setReply(Map item) {
+    setState(() {
+      _replyToId = item['timestamp']?.toString();
+      _replyToText = item['type'] == 'text'
+          ? (item['text'] ?? '')
+          : '[${item['type'] ?? 'file'}]';
+      _replyToSender = item['sender'] == currentUid ? 'You' : widget.peerName;
+    });
+  }
+
+  void _cancelReply() {
+    setState(() {
+      _replyToId = null;
+      _replyToText = null;
+      _replyToSender = null;
+    });
   }
 
   void _startCall(bool isVideo) async {
@@ -894,6 +925,36 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     );
   }
 
+  Widget _buildReplyPreviewInBubble(Map item) {
+    if (item['replyToText'] == null) return const SizedBox.shrink();
+    return Container(
+      margin: const EdgeInsets.only(bottom: 4),
+      padding: const EdgeInsets.all(6),
+      decoration: BoxDecoration(
+        color: Colors.black12,
+        borderRadius: BorderRadius.circular(6),
+        border: const Border(left: BorderSide(color: Colors.teal, width: 3)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Text(
+            item['replyToSender'] ?? '',
+            style: const TextStyle(
+                fontWeight: FontWeight.bold, fontSize: 11, color: Colors.teal),
+          ),
+          Text(
+            item['replyToText'] ?? '',
+            style: const TextStyle(fontSize: 12),
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+          ),
+        ],
+      ),
+    );
+  }
+
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
@@ -948,28 +1009,42 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                     itemBuilder: (context, index) {
                       var item = list[index];
                       bool isMe = item['sender'] == currentUid;
-                      return Align(
-                        alignment:
-                            isMe ? Alignment.centerRight : Alignment.centerLeft,
-                        child: Container(
-                          margin: const EdgeInsets.symmetric(
-                              horizontal: 8, vertical: 4),
-                          padding: const EdgeInsets.all(10),
-                          decoration: BoxDecoration(
-                            color: isMe
-                                ? Colors.teal.shade100
-                                : Colors.grey.shade300,
-                            borderRadius: BorderRadius.circular(10),
-                          ),
-                          child: Row(
-                            mainAxisSize: MainAxisSize.min,
-                            children: [
-                              Flexible(child: _buildMessageContent(item)),
-                              if (isMe) ...[
-                                const SizedBox(width: 4),
-                                _buildTickIcon(item['status'] ?? 'sent'),
+                      return GestureDetector(
+                        onLongPress: () => _setReply(item),
+                        child: Align(
+                          alignment: isMe
+                              ? Alignment.centerRight
+                              : Alignment.centerLeft,
+                          child: Container(
+                            margin: const EdgeInsets.symmetric(
+                                horizontal: 8, vertical: 4),
+                            padding: const EdgeInsets.all(10),
+                            constraints: BoxConstraints(
+                                maxWidth:
+                                    MediaQuery.of(context).size.width * 0.75),
+                            decoration: BoxDecoration(
+                              color: isMe
+                                  ? Colors.teal.shade100
+                                  : Colors.grey.shade300,
+                              borderRadius: BorderRadius.circular(10),
+                            ),
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                _buildReplyPreviewInBubble(item),
+                                Row(
+                                  mainAxisSize: MainAxisSize.min,
+                                  children: [
+                                    Flexible(child: _buildMessageContent(item)),
+                                    if (isMe) ...[
+                                      const SizedBox(width: 4),
+                                      _buildTickIcon(item['status'] ?? 'sent'),
+                                    ],
+                                  ],
+                                ),
                               ],
-                            ],
+                            ),
                           ),
                         ),
                       );
@@ -980,6 +1055,42 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
               },
             ),
           ),
+          if (_replyToId != null)
+            Container(
+              width: double.infinity,
+              color: Colors.teal.shade50,
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+              child: Row(
+                children: [
+                  const Icon(Icons.reply, size: 18, color: Colors.teal),
+                  const SizedBox(width: 6),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          'Replying to $_replyToSender',
+                          style: const TextStyle(
+                              fontSize: 11,
+                              fontWeight: FontWeight.bold,
+                              color: Colors.teal),
+                        ),
+                        Text(
+                          _replyToText ?? '',
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(fontSize: 12),
+                        ),
+                      ],
+                    ),
+                  ),
+                  IconButton(
+                    icon: const Icon(Icons.close, size: 18),
+                    onPressed: _cancelReply,
+                  ),
+                ],
+              ),
+            ),
           Padding(
             padding: const EdgeInsets.all(8.0),
             child: Row(
@@ -988,9 +1099,25 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                   icon: const Icon(Icons.attach_file),
                   onPressed: _showAttachOptions,
                 ),
+                IconButton(
+                  icon: Icon(
+                    _showEmojiPicker
+                        ? Icons.keyboard
+                        : Icons.emoji_emotions_outlined,
+                  ),
+                  onPressed: () {
+                    setState(() => _showEmojiPicker = !_showEmojiPicker);
+                    if (_showEmojiPicker) FocusScope.of(context).unfocus();
+                  },
+                ),
                 Expanded(
                   child: TextField(
                     controller: _msgController,
+                    onTap: () {
+                      if (_showEmojiPicker) {
+                        setState(() => _showEmojiPicker = false);
+                      }
+                    },
                     decoration: const InputDecoration(
                       hintText: 'Type a message...',
                       border: OutlineInputBorder(),
@@ -1032,6 +1159,15 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                     child: const Text('Cancel'),
                   ),
                 ],
+              ),
+            ),
+          if (_showEmojiPicker)
+            SizedBox(
+              height: 250,
+              child: EmojiPicker(
+                onEmojiSelected: (category, emoji) {
+                  _msgController.text += emoji.emoji;
+                },
               ),
             ),
         ],
