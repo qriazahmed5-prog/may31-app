@@ -1,3 +1,6 @@
+import 'dart:io';
+import 'dart:convert';
+import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import 'package:firebase_core/firebase_core.dart';
 import 'package:firebase_auth/firebase_auth.dart';
@@ -5,6 +8,11 @@ import 'package:firebase_database/firebase_database.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
 import 'package:audioplayers/audioplayers.dart';
 import 'package:permission_handler/permission_handler.dart';
+import 'package:file_picker/file_picker.dart';
+import 'package:image_picker/image_picker.dart';
+import 'package:path_provider/path_provider.dart';
+import 'package:video_player/video_player.dart';
+import 'package:gal/gal.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -267,6 +275,14 @@ class _ChatScreenState extends State<ChatScreen> {
   late String chatId;
   int _lastMessageCount = 0;
 
+  // ---- File sharing (P2P + chunking) ----
+  RTCPeerConnection? _fileConn;
+  RTCDataChannel? _fileChannel;
+  bool _fileChannelReady = false;
+  final Map<String, List<Uint8List?>> _recvChunks = {};
+  final Map<String, Map<String, dynamic>> _recvMeta = {};
+  final Map<String, String> _localFilePaths = {};
+
   @override
   void initState() {
     super.initState();
@@ -274,6 +290,7 @@ class _ChatScreenState extends State<ChatScreen> {
     ids.sort();
     chatId = '${ids[0]}_${ids[1]}';
     _listenForNewMessages();
+    _setupFileChannel();
   }
 
   void _listenForNewMessages() {
@@ -293,10 +310,311 @@ class _ChatScreenState extends State<ChatScreen> {
     });
   }
 
+  // -------- P2P Data Channel Setup for File Transfer --------
+  void _setupFileChannel() async {
+    _fileConn = await createPeerConnection({
+      'iceServers': [
+        {'urls': 'stun:stun.l.google.com:19302'},
+      ]
+    });
+
+    final signalRef = _dbRef.child('fileSignal').child(chatId);
+    bool isInitiator = currentUid.compareTo(widget.peerUid) < 0;
+
+    _fileConn!.onIceCandidate = (RTCIceCandidate candidate) {
+      final path = isInitiator ? 'callerCandidates' : 'calleeCandidates';
+      signalRef.child(path).push().set(candidate.toMap());
+    };
+
+    if (isInitiator) {
+      await signalRef.remove();
+
+      _fileChannel = await _fileConn!.createDataChannel(
+        'fileChannel',
+        RTCDataChannelInit()..ordered = true,
+      );
+      _fileChannel!.onMessage = _handleDataChannelMessage;
+      _fileChannel!.onDataChannelState = (state) {
+        setState(() {
+          _fileChannelReady = state == RTCDataChannelState.RTCDataChannelOpen;
+        });
+      };
+
+      RTCSessionDescription offer = await _fileConn!.createOffer();
+      await _fileConn!.setLocalDescription(offer);
+      await signalRef.child('offer').set({'sdp': offer.sdp, 'type': offer.type});
+
+      signalRef.child('answer').onValue.listen((event) async {
+        final data = event.snapshot.value as Map<dynamic, dynamic>?;
+        if (data != null && _fileConn!.getRemoteDescription() == null) {
+          await _fileConn!.setRemoteDescription(
+            RTCSessionDescription(data['sdp'], data['type']),
+          );
+        }
+      });
+
+      signalRef.child('calleeCandidates').onChildAdded.listen((event) {
+        final data = event.snapshot.value as Map<dynamic, dynamic>?;
+        if (data != null) {
+          _fileConn!.addCandidate(RTCIceCandidate(
+            data['candidate'],
+            data['sdpMid'],
+            data['sdpMLineIndex'],
+          ));
+        }
+      });
+    } else {
+      _fileConn!.onDataChannel = (RTCDataChannel channel) {
+        _fileChannel = channel;
+        _fileChannel!.onMessage = _handleDataChannelMessage;
+        _fileChannel!.onDataChannelState = (state) {
+          setState(() {
+            _fileChannelReady = state == RTCDataChannelState.RTCDataChannelOpen;
+          });
+        };
+      };
+
+      signalRef.child('offer').onValue.listen((event) async {
+        final data = event.snapshot.value as Map<dynamic, dynamic>?;
+        if (data != null && _fileConn!.getRemoteDescription() == null) {
+          await _fileConn!.setRemoteDescription(
+            RTCSessionDescription(data['sdp'], data['type']),
+          );
+          RTCSessionDescription answer = await _fileConn!.createAnswer();
+          await _fileConn!.setLocalDescription(answer);
+          await signalRef.child('answer').set({'sdp': answer.sdp, 'type': answer.type});
+        }
+      });
+
+      signalRef.child('callerCandidates').onChildAdded.listen((event) {
+        final data = event.snapshot.value as Map<dynamic, dynamic>?;
+        if (data != null) {
+          _fileConn!.addCandidate(RTCIceCandidate(
+            data['candidate'],
+            data['sdpMid'],
+            data['sdpMLineIndex'],
+          ));
+        }
+      });
+    }
+  }
+
+  // -------- Receiving chunks --------
+  void _handleDataChannelMessage(RTCDataChannelMessage message) async {
+    if (message.isBinary) return;
+    final data = jsonDecode(message.text);
+
+    if (data['t'] == 'meta') {
+      final id = data['id'];
+      _recvMeta[id] = data;
+      _recvChunks[id] = List<Uint8List?>.filled(data['total'], null);
+    } else if (data['t'] == 'chunk') {
+      final id = data['id'];
+      final i = data['i'];
+      final bytes = base64Decode(data['d']);
+      if (_recvChunks[id] == null) return;
+      _recvChunks[id]![i] = bytes;
+
+      bool complete = _recvChunks[id]!.every((e) => e != null);
+      if (complete) {
+        final meta = _recvMeta[id]!;
+        final builder = BytesBuilder();
+        for (var c in _recvChunks[id]!) {
+          builder.add(c!);
+        }
+        final finalBytes = builder.toBytes();
+        final dir = await getApplicationDocumentsDirectory();
+        final localFile = File('${dir.path}/${meta['name']}');
+        await localFile.writeAsBytes(finalBytes);
+
+        if (mounted) {
+          setState(() {
+            _localFilePaths[id] = localFile.path;
+          });
+        }
+        _recvChunks.remove(id);
+        _recvMeta.remove(id);
+      }
+    }
+  }
+
+  // -------- Sending files with chunking --------
+  Future<void> _sendFileBytes(Uint8List bytes, String fileName, String mime) async {
+    if (_fileChannel == null ||
+        _fileChannel!.state != RTCDataChannelState.RTCDataChannelOpen) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Peer is not connected right now. Ask them to open this chat.'),
+        ),
+      );
+      return;
+    }
+
+    String fileId = DateTime.now().millisecondsSinceEpoch.toString();
+    const chunkSize = 16000;
+    int total = (bytes.length / chunkSize).ceil();
+    String kind = mime.startsWith('image/')
+        ? 'image'
+        : mime.startsWith('video/')
+            ? 'video'
+            : 'file';
+
+    _fileChannel!.send(RTCDataChannelMessage(jsonEncode({
+      't': 'meta',
+      'id': fileId,
+      'name': fileName,
+      'size': bytes.length,
+      'mime': mime,
+      'total': total,
+    })));
+
+    for (int i = 0; i < total; i++) {
+      int start = i * chunkSize;
+      int end = (start + chunkSize > bytes.length) ? bytes.length : start + chunkSize;
+      Uint8List chunk = bytes.sublist(start, end);
+      String b64 = base64Encode(chunk);
+
+      _fileChannel!.send(RTCDataChannelMessage(jsonEncode({
+        't': 'chunk',
+        'id': fileId,
+        'i': i,
+        'd': b64,
+      })));
+
+      await Future.delayed(const Duration(milliseconds: 5));
+    }
+
+    final dir = await getApplicationDocumentsDirectory();
+    final localFile = File('${dir.path}/$fileName');
+    await localFile.writeAsBytes(bytes);
+    if (mounted) {
+      setState(() {
+        _localFilePaths[fileId] = localFile.path;
+      });
+    }
+
+    _dbRef.child('chats').child(chatId).child('messages').push().set({
+      'sender': currentUid,
+      'type': kind,
+      'fileId': fileId,
+      'fileName': fileName,
+      'timestamp': DateTime.now().millisecondsSinceEpoch,
+      'status': 'sent',
+    });
+  }
+
+  String _guessMime(String name) {
+    final ext = name.split('.').last.toLowerCase();
+    if (['jpg', 'jpeg', 'png', 'gif', 'webp'].contains(ext)) return 'image/$ext';
+    if (['mp4', 'mov', 'mkv', 'avi'].contains(ext)) return 'video/$ext';
+    return 'application/octet-stream';
+  }
+
+  void _pickImageOrVideo() async {
+    final picker = ImagePicker();
+    final XFile? picked = await showModalBottomSheet<XFile?>(
+      context: context,
+      builder: (context) => SafeArea(
+        child: Wrap(
+          children: [
+            ListTile(
+              leading: const Icon(Icons.photo),
+              title: const Text('Photo from Gallery'),
+              onTap: () async {
+                final f = await picker.pickImage(source: ImageSource.gallery);
+                if (mounted) Navigator.pop(context, f);
+              },
+            ),
+            ListTile(
+              leading: const Icon(Icons.videocam),
+              title: const Text('Video from Gallery'),
+              onTap: () async {
+                final f = await picker.pickVideo(source: ImageSource.gallery);
+                if (mounted) Navigator.pop(context, f);
+              },
+            ),
+          ],
+        ),
+      ),
+    );
+    if (picked == null) return;
+    final bytes = await picked.readAsBytes();
+    final mime = _guessMime(picked.name);
+    await _sendFileBytes(bytes, picked.name, mime);
+  }
+
+  void _pickAnyFile() async {
+    FilePickerResult? result = await FilePicker.platform.pickFiles(withData: true);
+    if (result == null || result.files.single.bytes == null) return;
+    final bytes = result.files.single.bytes!;
+    final fileName = result.files.single.name;
+    final mime = _guessMime(fileName);
+    await _sendFileBytes(bytes, fileName, mime);
+  }
+
+  void _showAttachOptions() {
+    showModalBottomSheet(
+      context: context,
+      builder: (context) => SafeArea(
+        child: Wrap(
+          children: [
+            ListTile(
+              leading: const Icon(Icons.image),
+              title: const Text('Photo / Video'),
+              onTap: () {
+                Navigator.pop(context);
+                _pickImageOrVideo();
+              },
+            ),
+            ListTile(
+              leading: const Icon(Icons.insert_drive_file),
+              title: const Text('Document / Any File'),
+              onTap: () {
+                Navigator.pop(context);
+                _pickAnyFile();
+              },
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Future<void> _saveToGallery(String type, String localPath, String fileName) async {
+    try {
+      bool granted = await Gal.requestAccess();
+      if (!granted) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('Gallery permission denied')),
+          );
+        }
+        return;
+      }
+      if (type == 'image') {
+        await Gal.putImage(localPath, album: 'P2P Media Chat');
+      } else if (type == 'video') {
+        await Gal.putVideo(localPath, album: 'P2P Media Chat');
+      }
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Saved to Gallery')),
+        );
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Failed to save: $e')),
+        );
+      }
+    }
+  }
+
   void _sendMessage() {
     if (_msgController.text.trim().isNotEmpty) {
       _dbRef.child('chats').child(chatId).child('messages').push().set({
         'sender': currentUid,
+        'type': 'text',
         'text': _msgController.text.trim(),
         'timestamp': DateTime.now().millisecondsSinceEpoch,
         'status': 'sent',
@@ -337,9 +655,126 @@ class _ChatScreenState extends State<ChatScreen> {
     }
   }
 
+  Widget _buildMessageContent(Map item) {
+    String type = item['type'] ?? 'text';
+    if (type == 'text') {
+      return Text(item['text'] ?? '');
+    }
+
+    String? localPath = _localFilePaths[item['fileId']];
+    String fileName = item['fileName'] ?? 'File';
+
+    if (type == 'image') {
+      if (localPath == null) {
+        return Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Icon(Icons.image, size: 20),
+            const SizedBox(width: 4),
+            Flexible(
+              child: Text('$fileName (receiving...)', overflow: TextOverflow.ellipsis),
+            ),
+          ],
+        );
+      }
+      return Stack(
+        children: [
+          ClipRRect(
+            borderRadius: BorderRadius.circular(8),
+            child: Image.file(File(localPath), width: 180, fit: BoxFit.cover),
+          ),
+          Positioned(
+            right: 2,
+            bottom: 2,
+            child: GestureDetector(
+              onTap: () => _saveToGallery('image', localPath, fileName),
+              child: Container(
+                padding: const EdgeInsets.all(4),
+                decoration: BoxDecoration(
+                  color: Colors.black54,
+                  borderRadius: BorderRadius.circular(20),
+                ),
+                child: const Icon(Icons.download, color: Colors.white, size: 16),
+              ),
+            ),
+          ),
+        ],
+      );
+    }
+
+    if (type == 'video') {
+      if (localPath == null) {
+        return Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Icon(Icons.videocam, size: 20),
+            const SizedBox(width: 4),
+            Flexible(
+              child: Text('$fileName (receiving...)', overflow: TextOverflow.ellipsis),
+            ),
+          ],
+        );
+      }
+      return GestureDetector(
+        onTap: () {
+          Navigator.push(
+            context,
+            MaterialPageRoute(builder: (_) => VideoPlayerPage(filePath: localPath)),
+          );
+        },
+        child: Stack(
+          alignment: Alignment.center,
+          children: [
+            Container(
+              width: 180,
+              height: 120,
+              decoration: BoxDecoration(
+                color: Colors.black87,
+                borderRadius: BorderRadius.circular(8),
+              ),
+              child: const Icon(Icons.play_circle_fill, color: Colors.white, size: 48),
+            ),
+            Positioned(
+              right: 6,
+              bottom: 6,
+              child: GestureDetector(
+                onTap: () => _saveToGallery('video', localPath, fileName),
+                child: Container(
+                  padding: const EdgeInsets.all(4),
+                  decoration: BoxDecoration(
+                    color: Colors.black54,
+                    borderRadius: BorderRadius.circular(20),
+                  ),
+                  child: const Icon(Icons.download, color: Colors.white, size: 16),
+                ),
+              ),
+            ),
+          ],
+        ),
+      );
+    }
+
+    // Document / any other file
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Icon(localPath != null ? Icons.insert_drive_file : Icons.hourglass_bottom, size: 20),
+        const SizedBox(width: 4),
+        Flexible(
+          child: Text(
+            localPath != null ? fileName : '$fileName (receiving...)',
+            overflow: TextOverflow.ellipsis,
+          ),
+        ),
+      ],
+    );
+  }
+
   @override
   void dispose() {
     _notifPlayer.dispose();
+    _fileChannel?.close();
+    _fileConn?.close();
     super.dispose();
   }
 
@@ -361,6 +796,17 @@ class _ChatScreenState extends State<ChatScreen> {
       ),
       body: Column(
         children: [
+          if (!_fileChannelReady)
+            Container(
+              width: double.infinity,
+              color: Colors.orange.shade100,
+              padding: const EdgeInsets.symmetric(vertical: 6),
+              child: const Text(
+                'Connecting for file sharing...',
+                textAlign: TextAlign.center,
+                style: TextStyle(fontSize: 12),
+              ),
+            ),
           Expanded(
             child: StreamBuilder(
               stream: _dbRef.child('chats').child(chatId).child('messages').onValue,
@@ -392,7 +838,7 @@ class _ChatScreenState extends State<ChatScreen> {
                           child: Row(
                             mainAxisSize: MainAxisSize.min,
                             children: [
-                              Flexible(child: Text(item['text'] ?? '')),
+                              Flexible(child: _buildMessageContent(item)),
                               if (isMe) ...[
                                 const SizedBox(width: 4),
                                 _buildTickIcon(item['status'] ?? 'sent'),
@@ -412,6 +858,10 @@ class _ChatScreenState extends State<ChatScreen> {
             padding: const EdgeInsets.all(8.0),
             child: Row(
               children: [
+                IconButton(
+                  icon: const Icon(Icons.attach_file),
+                  onPressed: _showAttachOptions,
+                ),
                 Expanded(
                   child: TextField(
                     controller: _msgController,
@@ -430,6 +880,70 @@ class _ChatScreenState extends State<ChatScreen> {
           ),
         ],
       ),
+    );
+  }
+}
+
+// ---------------- Inline Video Player Page ----------------
+class VideoPlayerPage extends StatefulWidget {
+  final String filePath;
+  const VideoPlayerPage({super.key, required this.filePath});
+
+  @override
+  State<VideoPlayerPage> createState() => _VideoPlayerPageState();
+}
+
+class _VideoPlayerPageState extends State<VideoPlayerPage> {
+  late VideoPlayerController _controller;
+  bool _initialized = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _controller = VideoPlayerController.file(File(widget.filePath))
+      ..initialize().then((_) {
+        if (mounted) {
+          setState(() => _initialized = true);
+          _controller.play();
+        }
+      });
+  }
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: Colors.black,
+      appBar: AppBar(
+        backgroundColor: Colors.black,
+        foregroundColor: Colors.white,
+      ),
+      body: Center(
+        child: _initialized
+            ? AspectRatio(
+                aspectRatio: _controller.value.aspectRatio,
+                child: VideoPlayer(_controller),
+              )
+            : const CircularProgressIndicator(),
+      ),
+      floatingActionButton: _initialized
+          ? FloatingActionButton(
+              onPressed: () {
+                setState(() {
+                  _controller.value.isPlaying
+                      ? _controller.pause()
+                      : _controller.play();
+                });
+              },
+              child: Icon(
+                  _controller.value.isPlaying ? Icons.pause : Icons.play_arrow),
+            )
+          : null,
     );
   }
 }
