@@ -174,7 +174,6 @@ class _UsersListScreenState extends State<UsersListScreen> {
     _loadContactsAndUsers();
   }
 
-  // Normalize phone number: keep only digits, take last 10 (to ignore country code differences)
   String _normalize(String number) {
     String digits = number.replaceAll(RegExp(r'[^0-9]'), '');
     if (digits.length > 10) {
@@ -401,13 +400,14 @@ class ChatScreen extends StatefulWidget {
   State<ChatScreen> createState() => _ChatScreenState();
 }
 
-class _ChatScreenState extends State<ChatScreen> {
+class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   final String currentUid = FirebaseAuth.instance.currentUser?.uid ?? '';
   final DatabaseReference _dbRef = FirebaseDatabase.instance.ref();
   final TextEditingController _msgController = TextEditingController();
   final AudioPlayer _notifPlayer = AudioPlayer();
   late String chatId;
   int _lastMessageCount = 0;
+  bool _screenIsActive = true;
 
   // ---- File sharing (P2P + chunking) ----
   RTCPeerConnection? _fileConn;
@@ -425,6 +425,7 @@ class _ChatScreenState extends State<ChatScreen> {
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     List<String> ids = [currentUid, widget.peerUid];
     ids.sort();
     chatId = '${ids[0]}_${ids[1]}';
@@ -432,11 +433,18 @@ class _ChatScreenState extends State<ChatScreen> {
     _setupFileChannel();
   }
 
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    _screenIsActive = state == AppLifecycleState.resumed;
+  }
+
   void _listenForNewMessages() {
     _dbRef.child('chats').child(chatId).child('messages').onValue.listen((event) {
       if (event.snapshot.value == null) return;
       Map<dynamic, dynamic> map = event.snapshot.value as Map<dynamic, dynamic>;
       int count = map.length;
+
+      // Play notification sound for new incoming messages
       if (_lastMessageCount != 0 && count > _lastMessageCount) {
         List<dynamic> list = map.values.toList();
         list.sort((a, b) => (a['timestamp'] ?? 0).compareTo(b['timestamp'] ?? 0));
@@ -446,6 +454,31 @@ class _ChatScreenState extends State<ChatScreen> {
         }
       }
       _lastMessageCount = count;
+
+      // Mark peer's messages as delivered/seen
+      _updateIncomingMessageStatuses(map);
+    });
+  }
+
+  // Any message sent BY the peer TO me: mark as delivered (received here)
+  // and as seen (since this screen is currently open and active)
+  void _updateIncomingMessageStatuses(Map<dynamic, dynamic> map) {
+    map.forEach((key, value) {
+      final msg = value as Map<dynamic, dynamic>;
+      if (msg['sender'] != currentUid) {
+        final currentStatus = msg['status'] ?? 'sent';
+        final newStatus = _screenIsActive ? 'seen' : 'delivered';
+        if (currentStatus != 'seen' &&
+            (newStatus == 'seen' || currentStatus == 'sent')) {
+          _dbRef
+              .child('chats')
+              .child(chatId)
+              .child('messages')
+              .child(key)
+              .child('status')
+              .set(newStatus);
+        }
+      }
     });
   }
 
@@ -863,6 +896,7 @@ class _ChatScreenState extends State<ChatScreen> {
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _notifPlayer.dispose();
     _fileChannel?.close();
     _fileConn?.close();
