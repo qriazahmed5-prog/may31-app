@@ -12,6 +12,7 @@ import 'package:file_picker/file_picker.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:record/record.dart';
+import 'package:flutter_contacts/flutter_contacts.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -19,6 +20,7 @@ void main() async {
   await [
     Permission.camera,
     Permission.microphone,
+    Permission.contacts,
   ].request();
   runApp(const MyApp());
 }
@@ -147,7 +149,7 @@ class _PhoneAuthScreenState extends State<PhoneAuthScreen> {
   }
 }
 
-// ---------------- Users List Screen ----------------
+// ---------------- Users List Screen (Contact-based) ----------------
 class UsersListScreen extends StatefulWidget {
   const UsersListScreen({super.key});
 
@@ -161,10 +163,68 @@ class _UsersListScreenState extends State<UsersListScreen> {
   final AudioPlayer _ringPlayer = AudioPlayer();
   bool _isRinging = false;
 
+  bool _loading = true;
+  Set<String> _myContactNumbers = {};
+  List<Map<dynamic, dynamic>> _matchedUsers = [];
+
   @override
   void initState() {
     super.initState();
     _listenForIncomingCalls();
+    _loadContactsAndUsers();
+  }
+
+  // Normalize phone number: keep only digits, take last 10 (to ignore country code differences)
+  String _normalize(String number) {
+    String digits = number.replaceAll(RegExp(r'[^0-9]'), '');
+    if (digits.length > 10) {
+      digits = digits.substring(digits.length - 10);
+    }
+    return digits;
+  }
+
+  Future<void> _loadContactsAndUsers() async {
+    bool granted = await FlutterContacts.requestPermission();
+    if (!granted) {
+      setState(() => _loading = false);
+      return;
+    }
+
+    List<Contact> contacts =
+        await FlutterContacts.getContacts(withProperties: true);
+
+    Set<String> contactNumbers = {};
+    for (var c in contacts) {
+      for (var p in c.phones) {
+        contactNumbers.add(_normalize(p.number));
+      }
+    }
+    _myContactNumbers = contactNumbers;
+
+    final snapshot = await dbRef.child('users').get();
+    if (!snapshot.exists || snapshot.value == null) {
+      setState(() => _loading = false);
+      return;
+    }
+
+    Map<dynamic, dynamic> map = snapshot.value as Map<dynamic, dynamic>;
+    List<Map<dynamic, dynamic>> matched = [];
+    for (var entry in map.values) {
+      final user = entry as Map<dynamic, dynamic>;
+      if (user['uid'] == currentUid) continue;
+      final userPhone = user['phone'] ?? '';
+      final normalizedUserPhone = _normalize(userPhone);
+      if (_myContactNumbers.contains(normalizedUserPhone)) {
+        matched.add(user);
+      }
+    }
+
+    if (mounted) {
+      setState(() {
+        _matchedUsers = matched;
+        _loading = false;
+      });
+    }
   }
 
   void _listenForIncomingCalls() {
@@ -211,47 +271,51 @@ class _UsersListScreenState extends State<UsersListScreen> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: const Text('Chats')),
-      body: StreamBuilder(
-        stream: dbRef.child('users').onValue,
-        builder: (context, AsyncSnapshot<DatabaseEvent> snapshot) {
-          if (!snapshot.hasData || snapshot.data!.snapshot.value == null) {
-            return const Center(child: Text('No users yet'));
-          }
-          Map<dynamic, dynamic> map =
-              snapshot.data!.snapshot.value as Map<dynamic, dynamic>;
-          List<Map<dynamic, dynamic>> users = map.values
-              .map((e) => e as Map<dynamic, dynamic>)
-              .where((u) => u['uid'] != currentUid)
-              .toList();
-
-          if (users.isEmpty) {
-            return const Center(child: Text('No other users yet'));
-          }
-
-          return ListView.builder(
-            itemCount: users.length,
-            itemBuilder: (context, index) {
-              final user = users[index];
-              return ListTile(
-                leading: const CircleAvatar(child: Icon(Icons.person)),
-                title: Text(user['phone'] ?? 'Unknown'),
-                onTap: () {
-                  Navigator.push(
-                    context,
-                    MaterialPageRoute(
-                      builder: (context) => ChatScreen(
-                        peerUid: user['uid'],
-                        peerName: user['phone'] ?? 'Unknown',
-                      ),
-                    ),
-                  );
-                },
-              );
+      appBar: AppBar(
+        title: const Text('Chats'),
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.refresh),
+            onPressed: () {
+              setState(() => _loading = true);
+              _loadContactsAndUsers();
             },
-          );
-        },
+          ),
+        ],
       ),
+      body: _loading
+          ? const Center(child: CircularProgressIndicator())
+          : _matchedUsers.isEmpty
+              ? const Center(
+                  child: Padding(
+                    padding: EdgeInsets.all(24.0),
+                    child: Text(
+                      'None of your phone contacts are using this app yet.\nInvite them to chat here!',
+                      textAlign: TextAlign.center,
+                    ),
+                  ),
+                )
+              : ListView.builder(
+                  itemCount: _matchedUsers.length,
+                  itemBuilder: (context, index) {
+                    final user = _matchedUsers[index];
+                    return ListTile(
+                      leading: const CircleAvatar(child: Icon(Icons.person)),
+                      title: Text(user['phone'] ?? 'Unknown'),
+                      onTap: () {
+                        Navigator.push(
+                          context,
+                          MaterialPageRoute(
+                            builder: (context) => ChatScreen(
+                              peerUid: user['uid'],
+                              peerName: user['phone'] ?? 'Unknown',
+                            ),
+                          ),
+                        );
+                      },
+                    );
+                  },
+                ),
     );
   }
 }
