@@ -21,7 +21,7 @@ jobs:
       - name: Set up Flutter
         uses: subosito/flutter-action@v2
         with:
-          flutter-version: '3.19.6'
+          flutter-version: '3.24.5'
           channel: 'stable'
 
       - name: Backup google-services.json
@@ -38,9 +38,9 @@ jobs:
       - name: Set SDK versions
         run: |
           cat android/app/build.gradle
-          sed -i -E 's/compileSdk(Version)?[[:space:]]*=?[[:space:]]*flutter\.compileSdkVersion/compileSdkVersion 34/' android/app/build.gradle
-          sed -i -E 's/minSdk(Version)?[[:space:]]*=?[[:space:]]*flutter\.minSdkVersion/minSdkVersion 23/' android/app/build.gradle
-          sed -i -E 's/targetSdk(Version)?[[:space:]]*=?[[:space:]]*flutter\.targetSdkVersion/targetSdkVersion 34/' android/app/build.gradle
+          sed -i -E 's/compileSdk(Version)?[[:space:]]*=?[[:space:]]*flutter\.compileSdkVersion/compileSdk 34/' android/app/build.gradle
+          sed -i -E 's/minSdk(Version)?[[:space:]]*=?[[:space:]]*flutter\.minSdkVersion/minSdk 23/' android/app/build.gradle
+          sed -i -E 's/targetSdk(Version)?[[:space:]]*=?[[:space:]]*flutter\.targetSdkVersion/targetSdk 34/' android/app/build.gradle
           echo "---- After edit ----"
           cat android/app/build.gradle
 
