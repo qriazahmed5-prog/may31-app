@@ -16,6 +16,8 @@ import 'package:path_provider/path_provider.dart';
 import 'package:record/record.dart';
 import 'package:flutter_contacts/flutter_contacts.dart';
 import 'package:emoji_picker_flutter/emoji_picker_flutter.dart';
+import 'package:image_gallery_saver/image_gallery_saver.dart';
+import 'package:video_player/video_player.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -1544,6 +1546,65 @@ class _VoiceMessageBubbleState extends State<VoiceMessageBubble> {
   }
 }
 
+// ---------------- Inline Video Player Page ----------------
+class VideoPlayerPage extends StatefulWidget {
+  final String filePath;
+  const VideoPlayerPage({super.key, required this.filePath});
+
+  @override
+  State<VideoPlayerPage> createState() => _VideoPlayerPageState();
+}
+
+class _VideoPlayerPageState extends State<VideoPlayerPage> {
+  late VideoPlayerController _controller;
+  bool _initialized = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _controller = VideoPlayerController.file(File(widget.filePath))
+      ..initialize().then((_) {
+        if (mounted) {
+          setState(() => _initialized = true);
+          _controller.play();
+        }
+      });
+  }
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: Colors.black,
+      appBar: AppBar(backgroundColor: Colors.black, foregroundColor: Colors.white),
+      body: Center(
+        child: _initialized
+            ? AspectRatio(
+                aspectRatio: _controller.value.aspectRatio,
+                child: VideoPlayer(_controller),
+              )
+            : const CircularProgressIndicator(),
+      ),
+      floatingActionButton: _initialized
+          ? FloatingActionButton(
+              onPressed: () {
+                setState(() {
+                  _controller.value.isPlaying ? _controller.pause() : _controller.play();
+                });
+              },
+              child:
+                  Icon(_controller.value.isPlaying ? Icons.pause : Icons.play_arrow),
+            )
+          : null,
+    );
+  }
+}
+
 // ---------------- Private Chat Screen (1-on-1) ----------------
 class ChatScreen extends StatefulWidget {
   final String peerUid;
@@ -2011,6 +2072,28 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     }
   }
 
+  Future<void> _saveToGallery(String type, String localPath, String fileName) async {
+    try {
+      var result;
+      if (type == 'image') {
+        result = await ImageGallerySaver.saveFile(localPath, name: fileName);
+      } else if (type == 'video') {
+        result = await ImageGallerySaver.saveFile(localPath, name: fileName);
+      }
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text(result != null ? 'Saved to Gallery' : 'Failed to save')),
+        );
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Failed to save: $e')),
+        );
+      }
+    }
+  }
+
   Widget _buildMessageContent(Map item) {
     String type = item['type'] ?? 'text';
     if (type == 'text') {
@@ -2018,6 +2101,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     }
 
     String? localPath = _localFilePaths[item['fileId']];
+    String fileName = item['fileName'] ?? 'File';
 
     if (type == 'voice') {
       if (localPath == null) {
@@ -2034,26 +2118,96 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     }
 
     if (type == 'image') {
-      if (localPath != null) {
-        return ClipRRect(
-          borderRadius: BorderRadius.circular(8),
-          child: Image.file(File(localPath), width: 180, fit: BoxFit.cover),
+      if (localPath == null) {
+        return Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Icon(Icons.image, size: 20),
+            const SizedBox(width: 4),
+            Flexible(
+              child: Text('$fileName (receiving...)', overflow: TextOverflow.ellipsis),
+            ),
+          ],
         );
       }
-      return Row(
-        mainAxisSize: MainAxisSize.min,
+      return Stack(
         children: [
-          const Icon(Icons.image, size: 20),
-          const SizedBox(width: 4),
-          Flexible(
-            child: Text(item['fileName'] ?? 'Image (receiving...)',
-                overflow: TextOverflow.ellipsis),
+          ClipRRect(
+            borderRadius: BorderRadius.circular(8),
+            child: Image.file(File(localPath), width: 180, fit: BoxFit.cover),
+          ),
+          Positioned(
+            right: 2,
+            bottom: 2,
+            child: GestureDetector(
+              onTap: () => _saveToGallery('image', localPath, fileName),
+              child: Container(
+                padding: const EdgeInsets.all(4),
+                decoration: BoxDecoration(
+                  color: Colors.black54,
+                  borderRadius: BorderRadius.circular(20),
+                ),
+                child: const Icon(Icons.download, color: Colors.white, size: 16),
+              ),
+            ),
           ),
         ],
       );
     }
 
-    IconData icon = type == 'video' ? Icons.videocam : Icons.insert_drive_file;
+    if (type == 'video') {
+      if (localPath == null) {
+        return Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Icon(Icons.videocam, size: 20),
+            const SizedBox(width: 4),
+            Flexible(
+              child: Text('$fileName (receiving...)', overflow: TextOverflow.ellipsis),
+            ),
+          ],
+        );
+      }
+      return GestureDetector(
+        onTap: () {
+          Navigator.push(
+            context,
+            MaterialPageRoute(builder: (_) => VideoPlayerPage(filePath: localPath)),
+          );
+        },
+        child: Stack(
+          alignment: Alignment.center,
+          children: [
+            Container(
+              width: 180,
+              height: 120,
+              decoration: BoxDecoration(
+                color: Colors.black87,
+                borderRadius: BorderRadius.circular(8),
+              ),
+              child: const Icon(Icons.play_circle_fill, color: Colors.white, size: 48),
+            ),
+            Positioned(
+              right: 6,
+              bottom: 6,
+              child: GestureDetector(
+                onTap: () => _saveToGallery('video', localPath, fileName),
+                child: Container(
+                  padding: const EdgeInsets.all(4),
+                  decoration: BoxDecoration(
+                    color: Colors.black54,
+                    borderRadius: BorderRadius.circular(20),
+                  ),
+                  child: const Icon(Icons.download, color: Colors.white, size: 16),
+                ),
+              ),
+            ),
+          ],
+        ),
+      );
+    }
+
+    IconData icon = Icons.insert_drive_file;
     return Row(
       mainAxisSize: MainAxisSize.min,
       children: [
@@ -2061,9 +2215,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
         const SizedBox(width: 4),
         Flexible(
           child: Text(
-            localPath != null
-                ? (item['fileName'] ?? 'File')
-                : '${item['fileName'] ?? 'File'} (receiving...)',
+            localPath != null ? fileName : '$fileName (receiving...)',
             overflow: TextOverflow.ellipsis,
           ),
         ),
