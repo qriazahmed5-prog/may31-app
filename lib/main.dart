@@ -150,6 +150,98 @@ class _PhoneAuthScreenState extends State<PhoneAuthScreen> {
   }
 }
 
+// ---------------- Privacy Policy Screen ----------------
+class PrivacyPolicyScreen extends StatelessWidget {
+  const PrivacyPolicyScreen({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('Privacy Policy')),
+      body: const Padding(
+        padding: EdgeInsets.all(16.0),
+        child: SingleChildScrollView(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                'Privacy Policy',
+                style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
+              ),
+              SizedBox(height: 12),
+              Text(
+                'This app respects your privacy. Here is how your data is handled:',
+                style: TextStyle(fontSize: 14),
+              ),
+              SizedBox(height: 12),
+              Text('• Messages: Text messages are stored securely to enable delivery between you and your contacts.',
+                  style: TextStyle(fontSize: 14)),
+              SizedBox(height: 8),
+              Text('• Calls & Files: Audio calls, video calls, photos, videos, and files are sent directly (peer-to-peer) between devices and are not stored on any server.',
+                  style: TextStyle(fontSize: 14)),
+              SizedBox(height: 8),
+              Text('• Contacts: We access your phone contacts only to check which of your contacts also use this app. Your contacts are not uploaded or shared with anyone.',
+                  style: TextStyle(fontSize: 14)),
+              SizedBox(height: 8),
+              Text('• Phone Number: Your phone number is used only for account verification and to let your contacts find you on this app.',
+                  style: TextStyle(fontSize: 14)),
+              SizedBox(height: 8),
+              Text('• Microphone & Camera: Used only during calls, voice messages, and when you choose to send photos/videos.',
+                  style: TextStyle(fontSize: 14)),
+              SizedBox(height: 12),
+              Text(
+                'We do not sell or share your personal data with third parties.',
+                style: TextStyle(fontSize: 14),
+              ),
+              SizedBox(height: 20),
+              Text(
+                'Developed by Riaz Ahmed',
+                style: TextStyle(fontSize: 14, fontWeight: FontWeight.bold),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+// ---------------- About Screen ----------------
+class AboutScreen extends StatelessWidget {
+  const AboutScreen({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('About')),
+      body: const Padding(
+        padding: EdgeInsets.all(16.0),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              'P2P Media Chat',
+              style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
+            ),
+            SizedBox(height: 8),
+            Text('Version 1.0.0', style: TextStyle(fontSize: 14)),
+            SizedBox(height: 16),
+            Text(
+              'Developed by Riaz Ahmed',
+              style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+            ),
+            SizedBox(height: 8),
+            Text(
+              'A private, peer-to-peer messaging and calling app built for secure, direct communication.',
+              style: TextStyle(fontSize: 14),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
 // ---------------- Users List Screen (Contact-based) ----------------
 class UsersListScreen extends StatefulWidget {
   const UsersListScreen({super.key});
@@ -281,6 +373,32 @@ class _UsersListScreenState extends State<UsersListScreen> {
               _loadContactsAndUsers();
             },
           ),
+          PopupMenuButton<String>(
+            onSelected: (value) {
+              if (value == 'privacy') {
+                Navigator.push(
+                  context,
+                  MaterialPageRoute(
+                      builder: (context) => const PrivacyPolicyScreen()),
+                );
+              } else if (value == 'about') {
+                Navigator.push(
+                  context,
+                  MaterialPageRoute(builder: (context) => const AboutScreen()),
+                );
+              }
+            },
+            itemBuilder: (context) => [
+              const PopupMenuItem(
+                value: 'privacy',
+                child: Text('Privacy Policy'),
+              ),
+              const PopupMenuItem(
+                value: 'about',
+                child: Text('About'),
+              ),
+            ],
+          ),
         ],
       ),
       body: _loading
@@ -411,12 +529,10 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   bool _screenIsActive = true;
   bool _showEmojiPicker = false;
 
-  // ---- Reply feature ----
   String? _replyToId;
   String? _replyToText;
   String? _replyToSender;
 
-  // ---- File sharing (P2P + chunking) ----
   RTCPeerConnection? _fileConn;
   RTCDataChannel? _fileChannel;
   bool _fileChannelReady = false;
@@ -424,7 +540,6 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   final Map<String, Map<String, dynamic>> _recvMeta = {};
   final Map<String, String> _localFilePaths = {};
 
-  // ---- Voice recording ----
   final Record _audioRecorder = Record();
   bool _isRecording = false;
   String? _recordingPath;
@@ -485,7 +600,6 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     });
   }
 
-  // -------- P2P Data Channel Setup for File Transfer --------
   void _setupFileChannel() async {
     _fileConn = await createPeerConnection({
       'iceServers': [
@@ -574,7 +688,6 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     }
   }
 
-  // -------- Receiving chunks --------
   void _handleDataChannelMessage(RTCDataChannelMessage message) async {
     if (message.isBinary) return;
     final data = jsonDecode(message.text);
@@ -613,7 +726,6 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     }
   }
 
-  // -------- Sending files with chunking --------
   Future<void> _sendFileBytes(Uint8List bytes, String fileName, String mime) async {
     if (_fileChannel == null ||
         _fileChannel!.state != RTCDataChannelState.RTCDataChannelOpen) {
@@ -757,7 +869,6 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     );
   }
 
-  // -------- Voice recording --------
   void _startRecording() async {
     bool hasPermission = await _audioRecorder.hasPermission();
     if (!hasPermission) {
