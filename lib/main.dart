@@ -1,7 +1,9 @@
 import 'dart:io';
 import 'dart:convert';
+import 'dart:math';
 import 'dart:typed_data';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:firebase_core/firebase_core.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:firebase_database/firebase_database.dart';
@@ -40,9 +42,70 @@ class MyApp extends StatelessWidget {
       ),
       home: FirebaseAuth.instance.currentUser == null
           ? const PhoneAuthScreen()
-          : const UsersListScreen(),
+          : const HomeScreen(),
     );
   }
+}
+
+// ---------------- Shared Helper Functions ----------------
+String normalizePhone(String number) {
+  String digits = number.replaceAll(RegExp(r'[^0-9]'), '');
+  if (digits.length > 10) {
+    digits = digits.substring(digits.length - 10);
+  }
+  return digits;
+}
+
+String generateInviteCode() {
+  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+  final rnd = Random();
+  return List.generate(6, (_) => chars[rnd.nextInt(chars.length)]).join();
+}
+
+Future<List<Map<String, dynamic>>> getMatchedAppUsers(String currentUid) async {
+  bool granted = await FlutterContacts.requestPermission();
+  if (!granted) return [];
+
+  List<Contact> contacts = await FlutterContacts.getContacts(withProperties: true);
+  Set<String> contactNumbers = {};
+  for (var c in contacts) {
+    for (var p in c.phones) {
+      contactNumbers.add(normalizePhone(p.number));
+    }
+  }
+
+  final dbRef = FirebaseDatabase.instance.ref();
+  final snapshot = await dbRef.child('users').get();
+  List<Map<String, dynamic>> matched = [];
+
+  if (snapshot.exists && snapshot.value != null) {
+    Map<dynamic, dynamic> map = snapshot.value as Map<dynamic, dynamic>;
+    for (var entry in map.values) {
+      final user = entry as Map<dynamic, dynamic>;
+      if (user['uid'] == currentUid) continue;
+      final userPhone = user['phone'] ?? '';
+      if (contactNumbers.contains(normalizePhone(userPhone))) {
+        matched.add({
+          'uid': user['uid'],
+          'phone': user['phone'] ?? 'Unknown',
+          'photo': user['photo'],
+        });
+      }
+    }
+  }
+  return matched;
+}
+
+Widget avatarWidget(String? photoBase64, {double radius = 20, IconData fallback = Icons.person}) {
+  if (photoBase64 != null && photoBase64.isNotEmpty) {
+    try {
+      return CircleAvatar(
+        radius: radius,
+        backgroundImage: MemoryImage(base64Decode(photoBase64)),
+      );
+    } catch (_) {}
+  }
+  return CircleAvatar(radius: radius, child: Icon(fallback));
 }
 
 // ---------------- Phone Auth Screen ----------------
@@ -96,13 +159,11 @@ class _PhoneAuthScreenState extends State<PhoneAuthScreen> {
     final uid = FirebaseAuth.instance.currentUser!.uid;
     final phone = FirebaseAuth.instance.currentUser!.phoneNumber ?? '';
     final dbRef = FirebaseDatabase.instance.ref();
-    await dbRef.child('users').child(uid).set({
-      'uid': uid,
-      'phone': phone,
-    });
+    await dbRef.child('users').child(uid).child('uid').set(uid);
+    await dbRef.child('users').child(uid).child('phone').set(phone);
     Navigator.pushReplacement(
       context,
-      MaterialPageRoute(builder: (context) => const UsersListScreen()),
+      MaterialPageRoute(builder: (context) => const HomeScreen()),
     );
   }
 
@@ -150,6 +211,1173 @@ class _PhoneAuthScreenState extends State<PhoneAuthScreen> {
   }
 }
 
+// ---------------- Home Screen (Tabs: Chats / Groups) ----------------
+class HomeScreen extends StatefulWidget {
+  const HomeScreen({super.key});
+
+  @override
+  State<HomeScreen> createState() => _HomeScreenState();
+}
+
+class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateMixin {
+  final currentUid = FirebaseAuth.instance.currentUser?.uid ?? '';
+  final dbRef = FirebaseDatabase.instance.ref();
+  final AudioPlayer _ringPlayer = AudioPlayer();
+  bool _isRinging = false;
+  late TabController _tabController;
+
+  @override
+  void initState() {
+    super.initState();
+    _tabController = TabController(length: 2, vsync: this);
+    _listenForIncomingCalls();
+  }
+
+  void _listenForIncomingCalls() {
+    dbRef.child('calls').onChildAdded.listen((event) async {
+      final data = event.snapshot.value as Map<dynamic, dynamic>?;
+      if (data == null) return;
+      if (data['calleeId'] == currentUid && data['status'] == 'ringing') {
+        final callId = event.snapshot.key!;
+
+        _isRinging = true;
+        await _ringPlayer.setReleaseMode(ReleaseMode.loop);
+        await _ringPlayer.play(AssetSource('sounds/nokia.mp3'));
+
+        if (mounted) {
+          Navigator.push(
+            context,
+            MaterialPageRoute(
+              builder: (context) => CallScreen(
+                callId: callId,
+                peerUid: data['callerId'],
+                isVideo: data['isVideo'] ?? false,
+                isCaller: false,
+              ),
+            ),
+          ).then((_) => _stopRingtone());
+        }
+      }
+    });
+  }
+
+  void _stopRingtone() async {
+    if (_isRinging) {
+      await _ringPlayer.stop();
+      _isRinging = false;
+    }
+  }
+
+  @override
+  void dispose() {
+    _ringPlayer.dispose();
+    _tabController.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('P2P Media Chat'),
+        bottom: TabBar(
+          controller: _tabController,
+          tabs: const [
+            Tab(text: 'Chats', icon: Icon(Icons.chat)),
+            Tab(text: 'Groups', icon: Icon(Icons.group)),
+          ],
+        ),
+        actions: [
+          PopupMenuButton<String>(
+            onSelected: (value) {
+              if (value == 'profile') {
+                Navigator.push(
+                  context,
+                  MaterialPageRoute(builder: (context) => const ProfileScreen()),
+                );
+              } else if (value == 'privacy') {
+                Navigator.push(
+                  context,
+                  MaterialPageRoute(builder: (context) => const PrivacyPolicyScreen()),
+                );
+              } else if (value == 'about') {
+                Navigator.push(
+                  context,
+                  MaterialPageRoute(builder: (context) => const AboutScreen()),
+                );
+              }
+            },
+            itemBuilder: (context) => [
+              const PopupMenuItem(value: 'profile', child: Text('My Profile')),
+              const PopupMenuItem(value: 'privacy', child: Text('Privacy Policy')),
+              const PopupMenuItem(value: 'about', child: Text('About')),
+            ],
+          ),
+        ],
+      ),
+      body: TabBarView(
+        controller: _tabController,
+        children: const [
+          ChatsTabContent(),
+          GroupsTabContent(),
+        ],
+      ),
+    );
+  }
+}
+
+// ---------------- Chats Tab ----------------
+class ChatsTabContent extends StatefulWidget {
+  const ChatsTabContent({super.key});
+
+  @override
+  State<ChatsTabContent> createState() => _ChatsTabContentState();
+}
+
+class _ChatsTabContentState extends State<ChatsTabContent> {
+  final currentUid = FirebaseAuth.instance.currentUser?.uid ?? '';
+  bool _loading = true;
+  List<Map<String, dynamic>> _matchedUsers = [];
+
+  @override
+  void initState() {
+    super.initState();
+    _load();
+  }
+
+  Future<void> _load() async {
+    setState(() => _loading = true);
+    final users = await getMatchedAppUsers(currentUid);
+    if (mounted) {
+      setState(() {
+        _matchedUsers = users;
+        _loading = false;
+      });
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (_loading) return const Center(child: CircularProgressIndicator());
+    return RefreshIndicator(
+      onRefresh: _load,
+      child: _matchedUsers.isEmpty
+          ? ListView(
+              children: const [
+                Padding(
+                  padding: EdgeInsets.all(24.0),
+                  child: Text(
+                    'None of your phone contacts are using this app yet.\nPull down to refresh.',
+                    textAlign: TextAlign.center,
+                  ),
+                ),
+              ],
+            )
+          : ListView.builder(
+              itemCount: _matchedUsers.length,
+              itemBuilder: (context, index) {
+                final user = _matchedUsers[index];
+                return ListTile(
+                  leading: avatarWidget(user['photo']),
+                  title: Text(user['phone'] ?? 'Unknown'),
+                  onTap: () {
+                    Navigator.push(
+                      context,
+                      MaterialPageRoute(
+                        builder: (context) => ChatScreen(
+                          peerUid: user['uid'],
+                          peerName: user['phone'] ?? 'Unknown',
+                        ),
+                      ),
+                    );
+                  },
+                );
+              },
+            ),
+    );
+  }
+}
+
+// ---------------- Groups Tab ----------------
+class GroupsTabContent extends StatefulWidget {
+  const GroupsTabContent({super.key});
+
+  @override
+  State<GroupsTabContent> createState() => _GroupsTabContentState();
+}
+
+class _GroupsTabContentState extends State<GroupsTabContent> {
+  final currentUid = FirebaseAuth.instance.currentUser?.uid ?? '';
+  final dbRef = FirebaseDatabase.instance.ref();
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      body: StreamBuilder(
+        stream: dbRef.child('users').child(currentUid).child('groups').onValue,
+        builder: (context, AsyncSnapshot<DatabaseEvent> snapshot) {
+          if (!snapshot.hasData || snapshot.data!.snapshot.value == null) {
+            return const Center(
+              child: Padding(
+                padding: EdgeInsets.all(24.0),
+                child: Text(
+                  'You are not part of any group yet.\nCreate one or join with an invite code!',
+                  textAlign: TextAlign.center,
+                ),
+              ),
+            );
+          }
+          Map<dynamic, dynamic> groupIds =
+              snapshot.data!.snapshot.value as Map<dynamic, dynamic>;
+          List<String> ids = groupIds.keys.map((e) => e.toString()).toList();
+
+          return ListView.builder(
+            itemCount: ids.length,
+            itemBuilder: (context, index) {
+              final groupId = ids[index];
+              return StreamBuilder(
+                stream: dbRef.child('groups').child(groupId).onValue,
+                builder: (context, AsyncSnapshot<DatabaseEvent> groupSnap) {
+                  if (!groupSnap.hasData || groupSnap.data!.snapshot.value == null) {
+                    return const SizedBox.shrink();
+                  }
+                  final group = groupSnap.data!.snapshot.value as Map<dynamic, dynamic>;
+                  Map<dynamic, dynamic> members = group['members'] ?? {};
+                  return ListTile(
+                    leading: avatarWidget(group['photo'], fallback: Icons.group),
+                    title: Text(group['name'] ?? 'Group'),
+                    subtitle: Text('${members.length} members'),
+                    onTap: () {
+                      Navigator.push(
+                        context,
+                        MaterialPageRoute(
+                          builder: (context) => GroupChatScreen(groupId: groupId),
+                        ),
+                      );
+                    },
+                  );
+                },
+              );
+            },
+          );
+        },
+      ),
+      floatingActionButton: Column(
+        mainAxisAlignment: MainAxisAlignment.end,
+        crossAxisAlignment: CrossAxisAlignment.end,
+        children: [
+          FloatingActionButton.extended(
+            heroTag: 'joinGroup',
+            onPressed: () {
+              Navigator.push(
+                context,
+                MaterialPageRoute(builder: (context) => const JoinGroupScreen()),
+              );
+            },
+            label: const Text('Join'),
+            icon: const Icon(Icons.group_add),
+          ),
+          const SizedBox(height: 12),
+          FloatingActionButton.extended(
+            heroTag: 'createGroup',
+            onPressed: () {
+              Navigator.push(
+                context,
+                MaterialPageRoute(builder: (context) => const CreateGroupScreen()),
+              );
+            },
+            label: const Text('Create'),
+            icon: const Icon(Icons.add),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+// ---------------- Create Group Screen ----------------
+class CreateGroupScreen extends StatefulWidget {
+  const CreateGroupScreen({super.key});
+
+  @override
+  State<CreateGroupScreen> createState() => _CreateGroupScreenState();
+}
+
+class _CreateGroupScreenState extends State<CreateGroupScreen> {
+  final currentUid = FirebaseAuth.instance.currentUser?.uid ?? '';
+  final _nameController = TextEditingController();
+  bool _loading = true;
+  List<Map<String, dynamic>> _contacts = [];
+  Set<String> _selected = {};
+  String? _photoBase64;
+
+  @override
+  void initState() {
+    super.initState();
+    _load();
+  }
+
+  Future<void> _load() async {
+    final users = await getMatchedAppUsers(currentUid);
+    if (mounted) {
+      setState(() {
+        _contacts = users;
+        _loading = false;
+      });
+    }
+  }
+
+  Future<void> _pickPhoto() async {
+    final picker = ImagePicker();
+    final XFile? picked = await picker.pickImage(
+      source: ImageSource.gallery,
+      maxWidth: 300,
+      maxHeight: 300,
+      imageQuality: 60,
+    );
+    if (picked == null) return;
+    final bytes = await picked.readAsBytes();
+    setState(() {
+      _photoBase64 = base64Encode(bytes);
+    });
+  }
+
+  Future<void> _createGroup() async {
+    if (_nameController.text.trim().isEmpty || _selected.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Enter a group name and select at least 1 member')),
+      );
+      return;
+    }
+    final dbRef = FirebaseDatabase.instance.ref();
+    final groupRef = dbRef.child('groups').push();
+    final groupId = groupRef.key!;
+    final inviteCode = generateInviteCode();
+
+    Map<String, dynamic> membersMap = {currentUid: true};
+    Map<String, dynamic> adminsMap = {currentUid: true};
+    Map<String, dynamic> memberPhones = {};
+
+    final myPhone = FirebaseAuth.instance.currentUser?.phoneNumber ?? '';
+    memberPhones[currentUid] = myPhone;
+
+    for (var c in _contacts) {
+      if (_selected.contains(c['uid'])) {
+        membersMap[c['uid']] = true;
+        memberPhones[c['uid']] = c['phone'];
+      }
+    }
+
+    await groupRef.set({
+      'name': _nameController.text.trim(),
+      'photo': _photoBase64 ?? '',
+      'createdBy': currentUid,
+      'inviteCode': inviteCode,
+      'members': membersMap,
+      'admins': adminsMap,
+      'memberPhones': memberPhones,
+    });
+
+    await dbRef.child('inviteCodes').child(inviteCode).set(groupId);
+
+    for (var uid in membersMap.keys) {
+      await dbRef.child('users').child(uid).child('groups').child(groupId).set(true);
+    }
+
+    if (mounted) {
+      Navigator.pushReplacement(
+        context,
+        MaterialPageRoute(builder: (context) => GroupChatScreen(groupId: groupId)),
+      );
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('Create Group')),
+      body: _loading
+          ? const Center(child: CircularProgressIndicator())
+          : Column(
+              children: [
+                Padding(
+                  padding: const EdgeInsets.all(16.0),
+                  child: Column(
+                    children: [
+                      GestureDetector(
+                        onTap: _pickPhoto,
+                        child: CircleAvatar(
+                          radius: 40,
+                          backgroundImage: _photoBase64 != null
+                              ? MemoryImage(base64Decode(_photoBase64!))
+                              : null,
+                          child: _photoBase64 == null
+                              ? const Icon(Icons.camera_alt, size: 30)
+                              : null,
+                        ),
+                      ),
+                      const SizedBox(height: 12),
+                      TextField(
+                        controller: _nameController,
+                        decoration: const InputDecoration(
+                          labelText: 'Group Name',
+                          border: OutlineInputBorder(),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+                const Align(
+                  alignment: Alignment.centerLeft,
+                  child: Padding(
+                    padding: EdgeInsets.symmetric(horizontal: 16.0),
+                    child: Text('Select Members', style: TextStyle(fontWeight: FontWeight.bold)),
+                  ),
+                ),
+                Expanded(
+                  child: _contacts.isEmpty
+                      ? const Center(child: Text('No contacts using this app yet'))
+                      : ListView.builder(
+                          itemCount: _contacts.length,
+                          itemBuilder: (context, index) {
+                            final c = _contacts[index];
+                            final uid = c['uid'];
+                            return CheckboxListTile(
+                              secondary: avatarWidget(c['photo']),
+                              title: Text(c['phone'] ?? 'Unknown'),
+                              value: _selected.contains(uid),
+                              onChanged: (val) {
+                                setState(() {
+                                  if (val == true) {
+                                    _selected.add(uid);
+                                  } else {
+                                    _selected.remove(uid);
+                                  }
+                                });
+                              },
+                            );
+                          },
+                        ),
+                ),
+                Padding(
+                  padding: const EdgeInsets.all(12.0),
+                  child: ElevatedButton(
+                    onPressed: _createGroup,
+                    child: const Text('Create Group'),
+                  ),
+                ),
+              ],
+            ),
+    );
+  }
+}
+
+// ---------------- Join Group Screen ----------------
+class JoinGroupScreen extends StatefulWidget {
+  const JoinGroupScreen({super.key});
+
+  @override
+  State<JoinGroupScreen> createState() => _JoinGroupScreenState();
+}
+
+class _JoinGroupScreenState extends State<JoinGroupScreen> {
+  final _codeController = TextEditingController();
+  bool _loading = false;
+
+  Future<void> _join() async {
+    final code = _codeController.text.trim().toUpperCase();
+    if (code.isEmpty) return;
+    setState(() => _loading = true);
+    final dbRef = FirebaseDatabase.instance.ref();
+    final snap = await dbRef.child('inviteCodes').child(code).get();
+    if (!snap.exists || snap.value == null) {
+      setState(() => _loading = false);
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Invalid invite code')),
+        );
+      }
+      return;
+    }
+    final groupId = snap.value.toString();
+    final currentUid = FirebaseAuth.instance.currentUser?.uid ?? '';
+    final myPhone = FirebaseAuth.instance.currentUser?.phoneNumber ?? '';
+
+    await dbRef.child('groups').child(groupId).child('members').child(currentUid).set(true);
+    await dbRef.child('groups').child(groupId).child('memberPhones').child(currentUid).set(myPhone);
+    await dbRef.child('users').child(currentUid).child('groups').child(groupId).set(true);
+
+    setState(() => _loading = false);
+    if (mounted) {
+      Navigator.pushReplacement(
+        context,
+        MaterialPageRoute(builder: (context) => GroupChatScreen(groupId: groupId)),
+      );
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('Join Group')),
+      body: Padding(
+        padding: const EdgeInsets.all(16.0),
+        child: Column(
+          children: [
+            TextField(
+              controller: _codeController,
+              textCapitalization: TextCapitalization.characters,
+              decoration: const InputDecoration(
+                labelText: 'Enter Invite Code',
+                border: OutlineInputBorder(),
+              ),
+            ),
+            const SizedBox(height: 16),
+            _loading
+                ? const CircularProgressIndicator()
+                : ElevatedButton(
+                    onPressed: _join,
+                    child: const Text('Join Group'),
+                  ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+// ---------------- Group Chat Screen ----------------
+class GroupChatScreen extends StatefulWidget {
+  final String groupId;
+  const GroupChatScreen({super.key, required this.groupId});
+
+  @override
+  State<GroupChatScreen> createState() => _GroupChatScreenState();
+}
+
+class _GroupChatScreenState extends State<GroupChatScreen> {
+  final String currentUid = FirebaseAuth.instance.currentUser?.uid ?? '';
+  final DatabaseReference _dbRef = FirebaseDatabase.instance.ref();
+  final TextEditingController _msgController = TextEditingController();
+  final AudioPlayer _notifPlayer = AudioPlayer();
+  int _lastMessageCount = 0;
+  bool _showEmojiPicker = false;
+
+  String? _replyToText;
+  String? _replyToSender;
+
+  void _sendMessage() {
+    if (_msgController.text.trim().isEmpty) return;
+    final myPhone = FirebaseAuth.instance.currentUser?.phoneNumber ?? '';
+    final msgData = {
+      'sender': currentUid,
+      'senderPhone': myPhone,
+      'type': 'text',
+      'text': _msgController.text.trim(),
+      'timestamp': DateTime.now().millisecondsSinceEpoch,
+    };
+    if (_replyToText != null) {
+      msgData['replyToText'] = _replyToText ?? '';
+      msgData['replyToSender'] = _replyToSender ?? '';
+    }
+    _dbRef.child('groups').child(widget.groupId).child('messages').push().set(msgData);
+    _msgController.clear();
+    setState(() {
+      _replyToText = null;
+      _replyToSender = null;
+    });
+  }
+
+  void _setReply(Map item) {
+    setState(() {
+      _replyToText = item['text'] ?? '';
+      _replyToSender =
+          item['sender'] == currentUid ? 'You' : (item['senderPhone'] ?? 'Unknown');
+    });
+  }
+
+  void _cancelReply() {
+    setState(() {
+      _replyToText = null;
+      _replyToSender = null;
+    });
+  }
+
+  @override
+  void dispose() {
+    _notifPlayer.dispose();
+    super.dispose();
+  }
+
+  Widget _buildReplyPreviewInBubble(Map item) {
+    if (item['replyToText'] == null) return const SizedBox.shrink();
+    return Container(
+      margin: const EdgeInsets.only(bottom: 4),
+      padding: const EdgeInsets.all(6),
+      decoration: BoxDecoration(
+        color: Colors.black12,
+        borderRadius: BorderRadius.circular(6),
+        border: const Border(left: BorderSide(color: Colors.teal, width: 3)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Text(item['replyToSender'] ?? '',
+              style: const TextStyle(
+                  fontWeight: FontWeight.bold, fontSize: 11, color: Colors.teal)),
+          Text(item['replyToText'] ?? '',
+              style: const TextStyle(fontSize: 12),
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis),
+        ],
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: StreamBuilder(
+          stream: _dbRef.child('groups').child(widget.groupId).onValue,
+          builder: (context, AsyncSnapshot<DatabaseEvent> snapshot) {
+            if (snapshot.hasData && snapshot.data!.snapshot.value != null) {
+              final group = snapshot.data!.snapshot.value as Map<dynamic, dynamic>;
+              return Text(group['name'] ?? 'Group');
+            }
+            return const Text('Group');
+          },
+        ),
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.info_outline),
+            onPressed: () {
+              Navigator.push(
+                context,
+                MaterialPageRoute(
+                    builder: (context) => GroupInfoScreen(groupId: widget.groupId)),
+              );
+            },
+          ),
+        ],
+      ),
+      body: Column(
+        children: [
+          Container(
+            width: double.infinity,
+            color: Colors.blue.shade50,
+            padding: const EdgeInsets.symmetric(vertical: 4),
+            child: const Text(
+              'Group calls, photo, video and file sharing are not available yet',
+              textAlign: TextAlign.center,
+              style: TextStyle(fontSize: 11),
+            ),
+          ),
+          Expanded(
+            child: StreamBuilder(
+              stream: _dbRef.child('groups').child(widget.groupId).child('messages').onValue,
+              builder: (context, AsyncSnapshot<DatabaseEvent> snapshot) {
+                if (snapshot.hasData && snapshot.data!.snapshot.value != null) {
+                  Map<dynamic, dynamic> map =
+                      snapshot.data!.snapshot.value as Map<dynamic, dynamic>;
+                  List<dynamic> list = map.values.toList();
+                  list.sort((a, b) =>
+                      (a['timestamp'] ?? 0).compareTo(b['timestamp'] ?? 0));
+
+                  if (list.length > _lastMessageCount && _lastMessageCount != 0) {
+                    var lastMsg = list.last;
+                    if (lastMsg['sender'] != currentUid) {
+                      _notifPlayer.play(AssetSource('sounds/iphone.mp3'));
+                    }
+                  }
+                  _lastMessageCount = list.length;
+
+                  return ListView.builder(
+                    itemCount: list.length,
+                    itemBuilder: (context, index) {
+                      var item = list[index];
+                      bool isMe = item['sender'] == currentUid;
+                      return GestureDetector(
+                        onLongPress: () => _setReply(item),
+                        child: Align(
+                          alignment:
+                              isMe ? Alignment.centerRight : Alignment.centerLeft,
+                          child: Container(
+                            margin: const EdgeInsets.symmetric(
+                                horizontal: 8, vertical: 4),
+                            padding: const EdgeInsets.all(10),
+                            constraints: BoxConstraints(
+                                maxWidth: MediaQuery.of(context).size.width * 0.75),
+                            decoration: BoxDecoration(
+                              color: isMe
+                                  ? Colors.teal.shade100
+                                  : Colors.grey.shade300,
+                              borderRadius: BorderRadius.circular(10),
+                            ),
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                if (!isMe)
+                                  Text(
+                                    item['senderPhone'] ?? 'Unknown',
+                                    style: const TextStyle(
+                                        fontSize: 11,
+                                        fontWeight: FontWeight.bold,
+                                        color: Colors.teal),
+                                  ),
+                                _buildReplyPreviewInBubble(item),
+                                Text(item['text'] ?? ''),
+                              ],
+                            ),
+                          ),
+                        ),
+                      );
+                    },
+                  );
+                }
+                return const Center(child: Text('No messages yet. Say Hi 👋'));
+              },
+            ),
+          ),
+          if (_replyToText != null)
+            Container(
+              width: double.infinity,
+              color: Colors.teal.shade50,
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+              child: Row(
+                children: [
+                  const Icon(Icons.reply, size: 18, color: Colors.teal),
+                  const SizedBox(width: 6),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text('Replying to $_replyToSender',
+                            style: const TextStyle(
+                                fontSize: 11,
+                                fontWeight: FontWeight.bold,
+                                color: Colors.teal)),
+                        Text(_replyToText ?? '',
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: const TextStyle(fontSize: 12)),
+                      ],
+                    ),
+                  ),
+                  IconButton(icon: const Icon(Icons.close, size: 18), onPressed: _cancelReply),
+                ],
+              ),
+            ),
+          Padding(
+            padding: const EdgeInsets.all(8.0),
+            child: Row(
+              children: [
+                IconButton(
+                  icon: Icon(
+                      _showEmojiPicker ? Icons.keyboard : Icons.emoji_emotions_outlined),
+                  onPressed: () {
+                    setState(() => _showEmojiPicker = !_showEmojiPicker);
+                    if (_showEmojiPicker) FocusScope.of(context).unfocus();
+                  },
+                ),
+                Expanded(
+                  child: TextField(
+                    controller: _msgController,
+                    onTap: () {
+                      if (_showEmojiPicker) setState(() => _showEmojiPicker = false);
+                    },
+                    decoration: const InputDecoration(
+                      hintText: 'Type a message...',
+                      border: OutlineInputBorder(),
+                    ),
+                  ),
+                ),
+                IconButton(icon: const Icon(Icons.send), onPressed: _sendMessage),
+              ],
+            ),
+          ),
+          if (_showEmojiPicker)
+            SizedBox(
+              height: 250,
+              child: EmojiPicker(
+                onEmojiSelected: (category, emoji) {
+                  _msgController.text += emoji.emoji;
+                },
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+}
+
+// ---------------- Group Info Screen ----------------
+class GroupInfoScreen extends StatefulWidget {
+  final String groupId;
+  const GroupInfoScreen({super.key, required this.groupId});
+
+  @override
+  State<GroupInfoScreen> createState() => _GroupInfoScreenState();
+}
+
+class _GroupInfoScreenState extends State<GroupInfoScreen> {
+  final String currentUid = FirebaseAuth.instance.currentUser?.uid ?? '';
+  final DatabaseReference _dbRef = FirebaseDatabase.instance.ref();
+
+  Future<void> _editName(String currentName) async {
+    final controller = TextEditingController(text: currentName);
+    final newName = await showDialog<String>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Edit Group Name'),
+        content: TextField(controller: controller),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(context), child: const Text('Cancel')),
+          TextButton(
+            onPressed: () => Navigator.pop(context, controller.text.trim()),
+            child: const Text('Save'),
+          ),
+        ],
+      ),
+    );
+    if (newName != null && newName.isNotEmpty) {
+      await _dbRef.child('groups').child(widget.groupId).child('name').set(newName);
+    }
+  }
+
+  Future<void> _editPhoto() async {
+    final picker = ImagePicker();
+    final XFile? picked = await picker.pickImage(
+      source: ImageSource.gallery,
+      maxWidth: 300,
+      maxHeight: 300,
+      imageQuality: 60,
+    );
+    if (picked == null) return;
+    final bytes = await picked.readAsBytes();
+    await _dbRef.child('groups').child(widget.groupId).child('photo').set(base64Encode(bytes));
+  }
+
+  Future<void> _toggleAdmin(String uid, bool isCurrentlyAdmin) async {
+    if (isCurrentlyAdmin) {
+      await _dbRef.child('groups').child(widget.groupId).child('admins').child(uid).remove();
+    } else {
+      await _dbRef.child('groups').child(widget.groupId).child('admins').child(uid).set(true);
+    }
+  }
+
+  Future<void> _removeMember(String uid) async {
+    await _dbRef.child('groups').child(widget.groupId).child('members').child(uid).remove();
+    await _dbRef.child('groups').child(widget.groupId).child('admins').child(uid).remove();
+    await _dbRef.child('groups').child(widget.groupId).child('memberPhones').child(uid).remove();
+    await _dbRef.child('users').child(uid).child('groups').child(widget.groupId).remove();
+  }
+
+  Future<void> _leaveGroup() async {
+    await _removeMember(currentUid);
+    if (mounted) {
+      Navigator.popUntil(context, (route) => route.isFirst);
+    }
+  }
+
+  Future<void> _addMembers(List<String> currentMemberUids) async {
+    final contacts = await getMatchedAppUsers(currentUid);
+    final available =
+        contacts.where((c) => !currentMemberUids.contains(c['uid'])).toList();
+    if (available.isEmpty) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('All your contacts are already in this group')),
+        );
+      }
+      return;
+    }
+    Set<String> selected = {};
+    await showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      builder: (context) {
+        return StatefulBuilder(
+          builder: (context, setModalState) {
+            return SafeArea(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  const Padding(
+                    padding: EdgeInsets.all(12.0),
+                    child: Text('Add Members', style: TextStyle(fontWeight: FontWeight.bold)),
+                  ),
+                  ...available.map((c) => CheckboxListTile(
+                        title: Text(c['phone'] ?? 'Unknown'),
+                        value: selected.contains(c['uid']),
+                        onChanged: (val) {
+                          setModalState(() {
+                            if (val == true) {
+                              selected.add(c['uid']);
+                            } else {
+                              selected.remove(c['uid']);
+                            }
+                          });
+                        },
+                      )),
+                  Padding(
+                    padding: const EdgeInsets.all(12.0),
+                    child: ElevatedButton(
+                      onPressed: () async {
+                        for (var uid in selected) {
+                          final match = available.firstWhere((c) => c['uid'] == uid);
+                          await _dbRef
+                              .child('groups')
+                              .child(widget.groupId)
+                              .child('members')
+                              .child(uid)
+                              .set(true);
+                          await _dbRef
+                              .child('groups')
+                              .child(widget.groupId)
+                              .child('memberPhones')
+                              .child(uid)
+                              .set(match['phone']);
+                          await _dbRef
+                              .child('users')
+                              .child(uid)
+                              .child('groups')
+                              .child(widget.groupId)
+                              .set(true);
+                        }
+                        if (mounted) Navigator.pop(context);
+                      },
+                      child: const Text('Add Selected'),
+                    ),
+                  ),
+                ],
+              ),
+            );
+          },
+        );
+      },
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('Group Info')),
+      body: StreamBuilder(
+        stream: _dbRef.child('groups').child(widget.groupId).onValue,
+        builder: (context, AsyncSnapshot<DatabaseEvent> snapshot) {
+          if (!snapshot.hasData || snapshot.data!.snapshot.value == null) {
+            return const Center(child: CircularProgressIndicator());
+          }
+          final group = snapshot.data!.snapshot.value as Map<dynamic, dynamic>;
+          Map<dynamic, dynamic> members = group['members'] ?? {};
+          Map<dynamic, dynamic> admins = group['admins'] ?? {};
+          Map<dynamic, dynamic> memberPhones = group['memberPhones'] ?? {};
+          List<String> memberUids = members.keys.map((e) => e.toString()).toList();
+          bool amAdmin = admins.containsKey(currentUid);
+          String? photo = group['photo'];
+
+          return ListView(
+            children: [
+              const SizedBox(height: 16),
+              Center(
+                child: GestureDetector(
+                  onTap: amAdmin ? _editPhoto : null,
+                  child: CircleAvatar(
+                    radius: 45,
+                    backgroundImage: (photo != null && photo.isNotEmpty)
+                        ? MemoryImage(base64Decode(photo))
+                        : null,
+                    child: (photo == null || photo.isEmpty)
+                        ? const Icon(Icons.group, size: 40)
+                        : null,
+                  ),
+                ),
+              ),
+              const SizedBox(height: 12),
+              Center(
+                child: Row(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    Text(
+                      group['name'] ?? 'Group',
+                      style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+                    ),
+                    if (amAdmin)
+                      IconButton(
+                        icon: const Icon(Icons.edit, size: 18),
+                        onPressed: () => _editName(group['name'] ?? ''),
+                      ),
+                  ],
+                ),
+              ),
+              const SizedBox(height: 8),
+              Center(
+                child: Text('Invite Code: ${group['inviteCode'] ?? ''}',
+                    style: const TextStyle(
+                        fontWeight: FontWeight.bold, color: Colors.teal)),
+              ),
+              const SizedBox(height: 4),
+              Center(
+                child: TextButton.icon(
+                  onPressed: () {
+                    Clipboard.setData(ClipboardData(text: group['inviteCode'] ?? ''));
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      const SnackBar(content: Text('Invite code copied')),
+                    );
+                  },
+                  icon: const Icon(Icons.copy, size: 16),
+                  label: const Text('Copy Code'),
+                ),
+              ),
+              const Divider(),
+              Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 16.0),
+                child: Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                  children: [
+                    Text('${memberUids.length} Members',
+                        style: const TextStyle(fontWeight: FontWeight.bold)),
+                    if (amAdmin)
+                      TextButton.icon(
+                        onPressed: () => _addMembers(memberUids),
+                        icon: const Icon(Icons.person_add, size: 18),
+                        label: const Text('Add'),
+                      ),
+                  ],
+                ),
+              ),
+              ...memberUids.map((uid) {
+                bool isAdmin = admins.containsKey(uid);
+                String phone = memberPhones[uid] ?? 'Unknown';
+                bool isMe = uid == currentUid;
+                return ListTile(
+                  leading: const CircleAvatar(child: Icon(Icons.person)),
+                  title: Text(isMe ? '$phone (You)' : phone),
+                  subtitle: isAdmin
+                      ? const Text('Admin', style: TextStyle(color: Colors.teal))
+                      : null,
+                  trailing: (amAdmin && !isMe)
+                      ? PopupMenuButton<String>(
+                          onSelected: (value) {
+                            if (value == 'toggleAdmin') {
+                              _toggleAdmin(uid, isAdmin);
+                            } else if (value == 'remove') {
+                              _removeMember(uid);
+                            }
+                          },
+                          itemBuilder: (context) => [
+                            PopupMenuItem(
+                              value: 'toggleAdmin',
+                              child: Text(isAdmin ? 'Remove Admin' : 'Make Admin'),
+                            ),
+                            const PopupMenuItem(
+                              value: 'remove',
+                              child: Text('Remove from Group'),
+                            ),
+                          ],
+                        )
+                      : null,
+                );
+              }),
+              const Divider(),
+              Padding(
+                padding: const EdgeInsets.all(16.0),
+                child: ElevatedButton.icon(
+                  style: ElevatedButton.styleFrom(backgroundColor: Colors.red),
+                  onPressed: _leaveGroup,
+                  icon: const Icon(Icons.exit_to_app),
+                  label: const Text('Leave Group'),
+                ),
+              ),
+            ],
+          );
+        },
+      ),
+    );
+  }
+}
+
+// ---------------- Profile Screen ----------------
+class ProfileScreen extends StatefulWidget {
+  const ProfileScreen({super.key});
+
+  @override
+  State<ProfileScreen> createState() => _ProfileScreenState();
+}
+
+class _ProfileScreenState extends State<ProfileScreen> {
+  final currentUid = FirebaseAuth.instance.currentUser?.uid ?? '';
+  final dbRef = FirebaseDatabase.instance.ref();
+  String? _photoBase64;
+  bool _loading = true;
+
+  @override
+  void initState() {
+    super.initState();
+    _load();
+  }
+
+  Future<void> _load() async {
+    final snap = await dbRef.child('users').child(currentUid).child('photo').get();
+    if (snap.exists && snap.value != null) {
+      _photoBase64 = snap.value.toString();
+    }
+    if (mounted) setState(() => _loading = false);
+  }
+
+  Future<void> _pickPhoto() async {
+    final picker = ImagePicker();
+    final XFile? picked = await picker.pickImage(
+      source: ImageSource.gallery,
+      maxWidth: 300,
+      maxHeight: 300,
+      imageQuality: 60,
+    );
+    if (picked == null) return;
+    final bytes = await picked.readAsBytes();
+    final b64 = base64Encode(bytes);
+    await dbRef.child('users').child(currentUid).child('photo').set(b64);
+    setState(() => _photoBase64 = b64);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final phone = FirebaseAuth.instance.currentUser?.phoneNumber ?? '';
+    return Scaffold(
+      appBar: AppBar(title: const Text('My Profile')),
+      body: _loading
+          ? const Center(child: CircularProgressIndicator())
+          : Padding(
+              padding: const EdgeInsets.all(24.0),
+              child: Column(
+                children: [
+                  GestureDetector(
+                    onTap: _pickPhoto,
+                    child: CircleAvatar(
+                      radius: 55,
+                      backgroundImage: (_photoBase64 != null && _photoBase64!.isNotEmpty)
+                          ? MemoryImage(base64Decode(_photoBase64!))
+                          : null,
+                      child: (_photoBase64 == null || _photoBase64!.isEmpty)
+                          ? const Icon(Icons.camera_alt, size: 36)
+                          : null,
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  const Text('Tap photo to change',
+                      style: TextStyle(fontSize: 12, color: Colors.grey)),
+                  const SizedBox(height: 24),
+                  Text(phone, style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+                ],
+              ),
+            ),
+    );
+  }
+}
+
 // ---------------- Privacy Policy Screen ----------------
 class PrivacyPolicyScreen extends StatelessWidget {
   const PrivacyPolicyScreen({super.key});
@@ -174,16 +1402,19 @@ class PrivacyPolicyScreen extends StatelessWidget {
                 style: TextStyle(fontSize: 14),
               ),
               SizedBox(height: 12),
-              Text('• Messages: Text messages are stored securely to enable delivery between you and your contacts.',
+              Text('• Messages: Text messages are stored securely to enable delivery between you and your contacts or groups.',
                   style: TextStyle(fontSize: 14)),
               SizedBox(height: 8),
-              Text('• Calls & Files: Audio calls, video calls, photos, videos, and files are sent directly (peer-to-peer) between devices and are not stored on any server.',
+              Text('• Calls & Files: Audio calls, video calls, photos, videos, and files (in 1-on-1 chats) are sent directly (peer-to-peer) between devices and are not stored on any server.',
                   style: TextStyle(fontSize: 14)),
               SizedBox(height: 8),
               Text('• Contacts: We access your phone contacts only to check which of your contacts also use this app. Your contacts are not uploaded or shared with anyone.',
                   style: TextStyle(fontSize: 14)),
               SizedBox(height: 8),
               Text('• Phone Number: Your phone number is used only for account verification and to let your contacts find you on this app.',
+                  style: TextStyle(fontSize: 14)),
+              SizedBox(height: 8),
+              Text('• Profile & Group Photos: Stored securely to display within the app to your contacts and group members.',
                   style: TextStyle(fontSize: 14)),
               SizedBox(height: 8),
               Text('• Microphone & Camera: Used only during calls, voice messages, and when you choose to send photos/videos.',
@@ -238,202 +1469,6 @@ class AboutScreen extends StatelessWidget {
           ],
         ),
       ),
-    );
-  }
-}
-
-// ---------------- Users List Screen (Contact-based) ----------------
-class UsersListScreen extends StatefulWidget {
-  const UsersListScreen({super.key});
-
-  @override
-  State<UsersListScreen> createState() => _UsersListScreenState();
-}
-
-class _UsersListScreenState extends State<UsersListScreen> {
-  final currentUid = FirebaseAuth.instance.currentUser?.uid ?? '';
-  final dbRef = FirebaseDatabase.instance.ref();
-  final AudioPlayer _ringPlayer = AudioPlayer();
-  bool _isRinging = false;
-
-  bool _loading = true;
-  Set<String> _myContactNumbers = {};
-  List<Map<dynamic, dynamic>> _matchedUsers = [];
-
-  @override
-  void initState() {
-    super.initState();
-    _listenForIncomingCalls();
-    _loadContactsAndUsers();
-  }
-
-  String _normalize(String number) {
-    String digits = number.replaceAll(RegExp(r'[^0-9]'), '');
-    if (digits.length > 10) {
-      digits = digits.substring(digits.length - 10);
-    }
-    return digits;
-  }
-
-  Future<void> _loadContactsAndUsers() async {
-    bool granted = await FlutterContacts.requestPermission();
-    if (!granted) {
-      setState(() => _loading = false);
-      return;
-    }
-
-    List<Contact> contacts =
-        await FlutterContacts.getContacts(withProperties: true);
-
-    Set<String> contactNumbers = {};
-    for (var c in contacts) {
-      for (var p in c.phones) {
-        contactNumbers.add(_normalize(p.number));
-      }
-    }
-    _myContactNumbers = contactNumbers;
-
-    final snapshot = await dbRef.child('users').get();
-    if (!snapshot.exists || snapshot.value == null) {
-      setState(() => _loading = false);
-      return;
-    }
-
-    Map<dynamic, dynamic> map = snapshot.value as Map<dynamic, dynamic>;
-    List<Map<dynamic, dynamic>> matched = [];
-    for (var entry in map.values) {
-      final user = entry as Map<dynamic, dynamic>;
-      if (user['uid'] == currentUid) continue;
-      final userPhone = user['phone'] ?? '';
-      final normalizedUserPhone = _normalize(userPhone);
-      if (_myContactNumbers.contains(normalizedUserPhone)) {
-        matched.add(user);
-      }
-    }
-
-    if (mounted) {
-      setState(() {
-        _matchedUsers = matched;
-        _loading = false;
-      });
-    }
-  }
-
-  void _listenForIncomingCalls() {
-    dbRef.child('calls').onChildAdded.listen((event) async {
-      final data = event.snapshot.value as Map<dynamic, dynamic>?;
-      if (data == null) return;
-      if (data['calleeId'] == currentUid && data['status'] == 'ringing') {
-        final callId = event.snapshot.key!;
-
-        _isRinging = true;
-        await _ringPlayer.setReleaseMode(ReleaseMode.loop);
-        await _ringPlayer.play(AssetSource('sounds/nokia.mp3'));
-
-        if (mounted) {
-          Navigator.push(
-            context,
-            MaterialPageRoute(
-              builder: (context) => CallScreen(
-                callId: callId,
-                peerUid: data['callerId'],
-                isVideo: data['isVideo'] ?? false,
-                isCaller: false,
-              ),
-            ),
-          ).then((_) => _stopRingtone());
-        }
-      }
-    });
-  }
-
-  void _stopRingtone() async {
-    if (_isRinging) {
-      await _ringPlayer.stop();
-      _isRinging = false;
-    }
-  }
-
-  @override
-  void dispose() {
-    _ringPlayer.dispose();
-    super.dispose();
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return Scaffold(
-      appBar: AppBar(
-        title: const Text('Chats'),
-        actions: [
-          IconButton(
-            icon: const Icon(Icons.refresh),
-            onPressed: () {
-              setState(() => _loading = true);
-              _loadContactsAndUsers();
-            },
-          ),
-          PopupMenuButton<String>(
-            onSelected: (value) {
-              if (value == 'privacy') {
-                Navigator.push(
-                  context,
-                  MaterialPageRoute(
-                      builder: (context) => const PrivacyPolicyScreen()),
-                );
-              } else if (value == 'about') {
-                Navigator.push(
-                  context,
-                  MaterialPageRoute(builder: (context) => const AboutScreen()),
-                );
-              }
-            },
-            itemBuilder: (context) => [
-              const PopupMenuItem(
-                value: 'privacy',
-                child: Text('Privacy Policy'),
-              ),
-              const PopupMenuItem(
-                value: 'about',
-                child: Text('About'),
-              ),
-            ],
-          ),
-        ],
-      ),
-      body: _loading
-          ? const Center(child: CircularProgressIndicator())
-          : _matchedUsers.isEmpty
-              ? const Center(
-                  child: Padding(
-                    padding: EdgeInsets.all(24.0),
-                    child: Text(
-                      'None of your phone contacts are using this app yet.\nInvite them to chat here!',
-                      textAlign: TextAlign.center,
-                    ),
-                  ),
-                )
-              : ListView.builder(
-                  itemCount: _matchedUsers.length,
-                  itemBuilder: (context, index) {
-                    final user = _matchedUsers[index];
-                    return ListTile(
-                      leading: const CircleAvatar(child: Icon(Icons.person)),
-                      title: Text(user['phone'] ?? 'Unknown'),
-                      onTap: () {
-                        Navigator.push(
-                          context,
-                          MaterialPageRoute(
-                            builder: (context) => ChatScreen(
-                              peerUid: user['uid'],
-                              peerName: user['phone'] ?? 'Unknown',
-                            ),
-                          ),
-                        );
-                      },
-                    );
-                  },
-                ),
     );
   }
 }
@@ -509,7 +1544,7 @@ class _VoiceMessageBubbleState extends State<VoiceMessageBubble> {
   }
 }
 
-// ---------------- Private Chat Screen ----------------
+// ---------------- Private Chat Screen (1-on-1) ----------------
 class ChatScreen extends StatefulWidget {
   final String peerUid;
   final String peerName;
@@ -1123,9 +2158,8 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                       return GestureDetector(
                         onLongPress: () => _setReply(item),
                         child: Align(
-                          alignment: isMe
-                              ? Alignment.centerRight
-                              : Alignment.centerLeft,
+                          alignment:
+                              isMe ? Alignment.centerRight : Alignment.centerLeft,
                           child: Container(
                             margin: const EdgeInsets.symmetric(
                                 horizontal: 8, vertical: 4),
