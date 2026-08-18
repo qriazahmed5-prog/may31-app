@@ -273,6 +273,21 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
         await _ringPlayer.setReleaseMode(ReleaseMode.loop);
         await _ringPlayer.play(AssetSource('sounds/nokia.mp3'));
 
+        // Stop ringtone as soon as this call's status changes away from 'ringing'
+        // (accepted, declined, or ended) instead of waiting for the screen to close.
+        StreamSubscription? statusSub;
+        statusSub = dbRef
+            .child('calls')
+            .child(callId)
+            .child('status')
+            .onValue
+            .listen((e) {
+          if (e.snapshot.value != 'ringing') {
+            _stopRingtone();
+            statusSub?.cancel();
+          }
+        });
+
         if (mounted) {
           Navigator.push(
             context,
@@ -284,7 +299,12 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
                 isCaller: false,
               ),
             ),
-          ).then((_) => _stopRingtone());
+          ).then((_) {
+            _stopRingtone();
+            statusSub?.cancel();
+          });
+        } else {
+          statusSub.cancel();
         }
       }
     });
@@ -2922,7 +2942,6 @@ class _CallScreenState extends State<CallScreen> {
   final RTCVideoRenderer _remoteRenderer = RTCVideoRenderer();
   bool _renderersReady = false;
 
-  // 'incoming' -> 'ringing' (caller waiting) -> 'connecting' -> 'ongoing' -> 'ended'
   String _callStatus = 'connecting';
   bool _isMuted = false;
   bool _isCameraOff = false;
@@ -2934,9 +2953,9 @@ class _CallScreenState extends State<CallScreen> {
   int _durationSeconds = 0;
 
   Timer? _bitrateTimer;
-  double _currentVideoBitrate = 700000; // starting target bitrate (bps)
-  static const double _minVideoBitrate = 150000; // 150 kbps floor
-  static const double _maxVideoBitrate = 2500000; // 2.5 mbps ceiling
+  double _currentVideoBitrate = 700000;
+  static const double _minVideoBitrate = 150000;
+  static const double _maxVideoBitrate = 2500000;
 
   StreamSubscription? _callStatusSub;
   StreamSubscription? _remoteCandidatesSub;
@@ -3144,6 +3163,10 @@ class _CallScreenState extends State<CallScreen> {
 
   void _declineCall() {
     _dbRef.child('calls').child(widget.callId).child('status').set('declined');
+    // Give the caller a moment to see the status change before wiping the record
+    Future.delayed(const Duration(seconds: 3), () {
+      _dbRef.child('calls').child(widget.callId).remove();
+    });
     _cleanupAndPop();
   }
 
@@ -3191,11 +3214,6 @@ class _CallScreenState extends State<CallScreen> {
     await Helper.setSpeakerphoneOn(_isSpeakerOn);
   }
 
-  // ---------------- Dynamic Bitrate Adaptation (DBA) ----------------
-  // Periodically inspects WebRTC stats (packet loss, RTT, available bandwidth)
-  // and adjusts the outgoing video encoding's max bitrate to match current
-  // network conditions, backing off on loss/latency and ramping up on a
-  // healthy link.
   void _startBitrateAdaptation() {
     if (!widget.isVideo || _peerConn == null) return;
     _bitrateTimer?.cancel();
@@ -3240,16 +3258,12 @@ class _CallScreenState extends State<CallScreen> {
       double target = _currentVideoBitrate;
 
       if (lossRatio > 0.08) {
-        // Heavy loss - back off aggressively
         target = _currentVideoBitrate * 0.75;
       } else if (lossRatio > 0.03) {
-        // Mild loss - trim a bit
         target = _currentVideoBitrate * 0.9;
       } else if (roundTripTime != null && roundTripTime > 0.4) {
-        // High latency - hold back slightly
         target = _currentVideoBitrate * 0.95;
       } else {
-        // Healthy link - ramp up gradually
         target = _currentVideoBitrate * 1.1;
         if (availableOutgoingBitrate != null && availableOutgoingBitrate > 0) {
           final cap = availableOutgoingBitrate * 0.9;
@@ -3293,6 +3307,10 @@ class _CallScreenState extends State<CallScreen> {
   // ---------------- Cleanup ----------------
   void _endCall() {
     _dbRef.child('calls').child(widget.callId).child('status').set('ended');
+    // Give the peer a moment to see the status change before wiping the record
+    Future.delayed(const Duration(seconds: 3), () {
+      _dbRef.child('calls').child(widget.callId).remove();
+    });
     _cleanupAndPop();
   }
 
@@ -3353,7 +3371,6 @@ class _CallScreenState extends State<CallScreen> {
               ? const Center(child: CircularProgressIndicator())
               : Stack(
                   children: [
-                    // Remote video / avatar background
                     Positioned.fill(
                       child: (widget.isVideo && _remoteVideoOn && _remoteStream != null)
                           ? RTCVideoView(
@@ -3372,7 +3389,6 @@ class _CallScreenState extends State<CallScreen> {
                             ),
                     ),
 
-                    // Local preview (small, top-right)
                     if (widget.isVideo && _localStream != null && !_isCameraOff)
                       Positioned(
                         top: 16,
@@ -3394,7 +3410,6 @@ class _CallScreenState extends State<CallScreen> {
                         ),
                       ),
 
-                    // Top status bar
                     Positioned(
                       top: 16,
                       left: 16,
@@ -3418,7 +3433,6 @@ class _CallScreenState extends State<CallScreen> {
                       ),
                     ),
 
-                    // Bottom controls
                     Positioned(
                       left: 0,
                       right: 0,
