@@ -19,6 +19,9 @@ import 'package:emoji_picker_flutter/emoji_picker_flutter.dart';
 import 'package:image_gallery_saver/image_gallery_saver.dart';
 import 'package:video_player/video_player.dart';
 
+// ---------------- Theme Notifier ----------------
+final ValueNotifier<ThemeMode> themeNotifier = ValueNotifier(ThemeMode.system);
+
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
   await Firebase.initializeApp();
@@ -35,16 +38,29 @@ class MyApp extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return MaterialApp(
-      title: 'P2P Media Chat',
-      debugShowCheckedModeBanner: false,
-      theme: ThemeData(
-        colorScheme: ColorScheme.fromSeed(seedColor: Colors.teal),
-        useMaterial3: true,
-      ),
-      home: FirebaseAuth.instance.currentUser == null
-          ? const PhoneAuthScreen()
-          : const HomeScreen(),
+    return ValueListenableBuilder<ThemeMode>(
+      valueListenable: themeNotifier,
+      builder: (context, currentMode, _) {
+        return MaterialApp(
+          title: 'P2P Media Chat',
+          debugShowCheckedModeBanner: false,
+          themeMode: currentMode,
+          theme: ThemeData(
+            colorScheme: ColorScheme.fromSeed(seedColor: Colors.teal),
+            useMaterial3: true,
+          ),
+          darkTheme: ThemeData(
+            colorScheme: ColorScheme.fromSeed(
+              seedColor: Colors.teal,
+              brightness: Brightness.dark,
+            ),
+            useMaterial3: true,
+          ),
+          home: FirebaseAuth.instance.currentUser == null
+              ? const PhoneAuthScreen()
+              : const HomeScreen(),
+        );
+      },
     );
   }
 }
@@ -307,10 +323,16 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
                   context,
                   MaterialPageRoute(builder: (context) => const AboutScreen()),
                 );
+              } else if (value == 'settings') {
+                Navigator.push(
+                  context,
+                  MaterialPageRoute(builder: (context) => const SettingsScreen()),
+                );
               }
             },
             itemBuilder: (context) => [
               const PopupMenuItem(value: 'profile', child: Text('My Profile')),
+              const PopupMenuItem(value: 'settings', child: Text('Settings')),
               const PopupMenuItem(value: 'privacy', child: Text('Privacy Policy')),
               const PopupMenuItem(value: 'about', child: Text('About')),
             ],
@@ -328,6 +350,45 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
   }
 }
 
+// ---------------- Settings Screen ----------------
+class SettingsScreen extends StatelessWidget {
+  const SettingsScreen({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('Settings')),
+      body: ValueListenableBuilder<ThemeMode>(
+        valueListenable: themeNotifier,
+        builder: (context, currentMode, _) {
+          return ListView(
+            children: [
+              RadioListTile<ThemeMode>(
+                title: const Text('Light Mode'),
+                value: ThemeMode.light,
+                groupValue: currentMode,
+                onChanged: (mode) => themeNotifier.value = mode!,
+              ),
+              RadioListTile<ThemeMode>(
+                title: const Text('Dark Mode'),
+                value: ThemeMode.dark,
+                groupValue: currentMode,
+                onChanged: (mode) => themeNotifier.value = mode!,
+              ),
+              RadioListTile<ThemeMode>(
+                title: const Text('System Default'),
+                value: ThemeMode.system,
+                groupValue: currentMode,
+                onChanged: (mode) => themeNotifier.value = mode!,
+              ),
+            ],
+          );
+        },
+      ),
+    );
+  }
+}
+
 // ---------------- Chats Tab ----------------
 class ChatsTabContent extends StatefulWidget {
   const ChatsTabContent({super.key});
@@ -338,8 +399,10 @@ class ChatsTabContent extends StatefulWidget {
 
 class _ChatsTabContentState extends State<ChatsTabContent> {
   final currentUid = FirebaseAuth.instance.currentUser?.uid ?? '';
+  final dbRef = FirebaseDatabase.instance.ref();
   bool _loading = true;
   List<Map<String, dynamic>> _matchedUsers = [];
+  Set<String> _hiddenChats = {};
 
   @override
   void initState() {
@@ -350,20 +413,44 @@ class _ChatsTabContentState extends State<ChatsTabContent> {
   Future<void> _load() async {
     setState(() => _loading = true);
     final users = await getMatchedAppUsers(currentUid);
+    final hiddenSnap = await dbRef.child('users').child(currentUid).child('hiddenChats').get();
+    Set<String> hidden = {};
+    if (hiddenSnap.exists && hiddenSnap.value != null) {
+      Map<dynamic, dynamic> map = hiddenSnap.value as Map<dynamic, dynamic>;
+      hidden = map.keys.map((e) => e.toString()).toSet();
+    }
     if (mounted) {
       setState(() {
         _matchedUsers = users;
+        _hiddenChats = hidden;
         _loading = false;
       });
     }
   }
 
+  String _chatIdFor(String peerUid) {
+    List<String> ids = [currentUid, peerUid];
+    ids.sort();
+    return '${ids[0]}_${ids[1]}';
+  }
+
+  Future<void> _deleteChat(String peerUid) async {
+    final chatId = _chatIdFor(peerUid);
+    await dbRef.child('users').child(currentUid).child('hiddenChats').child(chatId).set(true);
+    setState(() {
+      _hiddenChats.add(chatId);
+    });
+  }
+
   @override
   Widget build(BuildContext context) {
     if (_loading) return const Center(child: CircularProgressIndicator());
+    final visibleUsers = _matchedUsers
+        .where((u) => !_hiddenChats.contains(_chatIdFor(u['uid'])))
+        .toList();
     return RefreshIndicator(
       onRefresh: _load,
-      child: _matchedUsers.isEmpty
+      child: visibleUsers.isEmpty
           ? ListView(
               children: const [
                 Padding(
@@ -376,23 +463,55 @@ class _ChatsTabContentState extends State<ChatsTabContent> {
               ],
             )
           : ListView.builder(
-              itemCount: _matchedUsers.length,
+              itemCount: visibleUsers.length,
               itemBuilder: (context, index) {
-                final user = _matchedUsers[index];
-                return ListTile(
-                  leading: avatarWidget(user['photo']),
-                  title: Text(user['phone'] ?? 'Unknown'),
-                  onTap: () {
-                    Navigator.push(
-                      context,
-                      MaterialPageRoute(
-                        builder: (context) => ChatScreen(
-                          peerUid: user['uid'],
-                          peerName: user['phone'] ?? 'Unknown',
-                        ),
-                      ),
-                    );
+                final user = visibleUsers[index];
+                return Dismissible(
+                  key: Key(user['uid']),
+                  direction: DismissDirection.endToStart,
+                  background: Container(
+                    color: Colors.red,
+                    alignment: Alignment.centerRight,
+                    padding: const EdgeInsets.symmetric(horizontal: 20),
+                    child: const Icon(Icons.delete, color: Colors.white),
+                  ),
+                  confirmDismiss: (direction) async {
+                    return await showDialog<bool>(
+                          context: context,
+                          builder: (context) => AlertDialog(
+                            title: const Text('Delete Chat?'),
+                            content: const Text(
+                                'This will remove the chat from your list. It will reappear if a new message arrives.'),
+                            actions: [
+                              TextButton(
+                                onPressed: () => Navigator.pop(context, false),
+                                child: const Text('Cancel'),
+                              ),
+                              TextButton(
+                                onPressed: () => Navigator.pop(context, true),
+                                child: const Text('Delete'),
+                              ),
+                            ],
+                          ),
+                        ) ??
+                        false;
                   },
+                  onDismissed: (direction) => _deleteChat(user['uid']),
+                  child: ListTile(
+                    leading: avatarWidget(user['photo']),
+                    title: Text(user['phone'] ?? 'Unknown'),
+                    onTap: () {
+                      Navigator.push(
+                        context,
+                        MaterialPageRoute(
+                          builder: (context) => ChatScreen(
+                            peerUid: user['uid'],
+                            peerName: user['phone'] ?? 'Unknown',
+                          ),
+                        ),
+                      ).then((_) => _load());
+                    },
+                  ),
                 );
               },
             ),
@@ -913,8 +1032,8 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
                                 maxWidth: MediaQuery.of(context).size.width * 0.75),
                             decoration: BoxDecoration(
                               color: isMe
-                                  ? Colors.teal.shade100
-                                  : Colors.grey.shade300,
+                                  ? Theme.of(context).colorScheme.primaryContainer
+                                  : Theme.of(context).colorScheme.surfaceVariant,
                               borderRadius: BorderRadius.circular(10),
                             ),
                             child: Column(
@@ -946,7 +1065,7 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
           if (_replyToText != null)
             Container(
               width: double.infinity,
-              color: Colors.teal.shade50,
+              color: Colors.teal.withOpacity(0.1),
               padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
               child: Row(
                 children: [
@@ -1624,6 +1743,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   int _lastMessageCount = 0;
   bool _screenIsActive = true;
   bool _showEmojiPicker = false;
+  bool _peerTyping = false;
 
   String? _replyToId;
   String? _replyToText;
@@ -1649,6 +1769,32 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     chatId = '${ids[0]}_${ids[1]}';
     _listenForNewMessages();
     _setupFileChannel();
+    _listenForTyping();
+    _msgController.addListener(_onTextChanged);
+    // Unhide chat when opened
+    _dbRef.child('users').child(currentUid).child('hiddenChats').child(chatId).remove();
+  }
+
+  void _onTextChanged() {
+    _dbRef
+        .child('chats')
+        .child(chatId)
+        .child('typing')
+        .child(currentUid)
+        .set(_msgController.text.trim().isNotEmpty);
+  }
+
+  void _listenForTyping() {
+    _dbRef
+        .child('chats')
+        .child(chatId)
+        .child('typing')
+        .child(widget.peerUid)
+        .onValue
+        .listen((event) {
+      final isTyping = event.snapshot.value == true;
+      if (mounted) setState(() => _peerTyping = isTyping);
+    });
   }
 
   @override
@@ -1668,6 +1814,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
         var lastMsg = list.last;
         if (lastMsg['sender'] != currentUid) {
           _notifPlayer.play(AssetSource('sounds/iphone.mp3'));
+          _dbRef.child('users').child(currentUid).child('hiddenChats').child(chatId).remove();
         }
       }
       _lastMessageCount = count;
@@ -2014,6 +2161,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       }
       _dbRef.child('chats').child(chatId).child('messages').push().set(msgData);
       _msgController.clear();
+      _dbRef.child('chats').child(chatId).child('typing').child(currentUid).set(false);
       setState(() {
         _replyToId = null;
         _replyToText = null;
@@ -2074,12 +2222,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
 
   Future<void> _saveToGallery(String type, String localPath, String fileName) async {
     try {
-      var result;
-      if (type == 'image') {
-        result = await ImageGallerySaver.saveFile(localPath, name: fileName);
-      } else if (type == 'video') {
-        result = await ImageGallerySaver.saveFile(localPath, name: fileName);
-      }
+      var result = await ImageGallerySaver.saveFile(localPath, name: fileName);
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(content: Text(result != null ? 'Saved to Gallery' : 'Failed to save')),
@@ -2256,6 +2399,8 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
+    _msgController.removeListener(_onTextChanged);
+    _dbRef.child('chats').child(chatId).child('typing').child(currentUid).set(false);
     _notifPlayer.dispose();
     _fileChannel?.close();
     _fileConn?.close();
@@ -2267,7 +2412,16 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: Text(widget.peerName),
+        title: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Text(widget.peerName),
+            if (_peerTyping)
+              const Text('typing...',
+                  style: TextStyle(fontSize: 12, color: Colors.white70)),
+          ],
+        ),
         actions: [
           IconButton(
             icon: const Icon(Icons.call),
@@ -2321,8 +2475,8 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                                     MediaQuery.of(context).size.width * 0.75),
                             decoration: BoxDecoration(
                               color: isMe
-                                  ? Colors.teal.shade100
-                                  : Colors.grey.shade300,
+                                  ? Theme.of(context).colorScheme.primaryContainer
+                                  : Theme.of(context).colorScheme.surfaceVariant,
                               borderRadius: BorderRadius.circular(10),
                             ),
                             child: Column(
@@ -2355,7 +2509,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
           if (_replyToId != null)
             Container(
               width: double.infinity,
-              color: Colors.teal.shade50,
+              color: Colors.teal.withOpacity(0.1),
               padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
               child: Row(
                 children: [
