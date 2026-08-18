@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:io';
 import 'dart:convert';
 import 'dart:math';
@@ -2047,7 +2048,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
 
       signalRef.child('answer').onValue.listen((event) async {
         final data = event.snapshot.value as Map<dynamic, dynamic>?;
-        if (data != null && _fileConn!.getRemoteDescription() == null) {
+        if (data != null && await _fileConn!.getRemoteDescription() == null) {
           await _fileConn!.setRemoteDescription(
             RTCSessionDescription(data['sdp'], data['type']),
           );
@@ -2077,7 +2078,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
 
       signalRef.child('offer').onValue.listen((event) async {
         final data = event.snapshot.value as Map<dynamic, dynamic>?;
-        if (data != null && _fileConn!.getRemoteDescription() == null) {
+        if (data != null && await _fileConn!.getRemoteDescription() == null) {
           await _fileConn!.setRemoteDescription(
             RTCSessionDescription(data['sdp'], data['type']),
           );
@@ -2902,4 +2903,617 @@ class CallScreen extends StatefulWidget {
     super.key,
     required this.callId,
     required this.peerUid,
-    required this.isVideo
+    required this.isVideo,
+    required this.isCaller,
+  });
+
+  @override
+  State<CallScreen> createState() => _CallScreenState();
+}
+
+class _CallScreenState extends State<CallScreen> {
+  final String currentUid = FirebaseAuth.instance.currentUser?.uid ?? '';
+  final DatabaseReference _dbRef = FirebaseDatabase.instance.ref();
+
+  RTCPeerConnection? _peerConn;
+  MediaStream? _localStream;
+  MediaStream? _remoteStream;
+  final RTCVideoRenderer _localRenderer = RTCVideoRenderer();
+  final RTCVideoRenderer _remoteRenderer = RTCVideoRenderer();
+  bool _renderersReady = false;
+
+  // 'incoming' -> 'ringing' (caller waiting) -> 'connecting' -> 'ongoing' -> 'ended'
+  String _callStatus = 'connecting';
+  bool _isMuted = false;
+  bool _isCameraOff = false;
+  bool _isFrontCamera = true;
+  bool _isSpeakerOn = true;
+  bool _remoteVideoOn = false;
+
+  Timer? _durationTimer;
+  int _durationSeconds = 0;
+
+  Timer? _bitrateTimer;
+  double _currentVideoBitrate = 700000; // starting target bitrate (bps)
+  static const double _minVideoBitrate = 150000; // 150 kbps floor
+  static const double _maxVideoBitrate = 2500000; // 2.5 mbps ceiling
+
+  StreamSubscription? _callStatusSub;
+  StreamSubscription? _remoteCandidatesSub;
+  StreamSubscription? _answerSub;
+
+  bool _cleanedUp = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _init();
+  }
+
+  Future<void> _init() async {
+    await _localRenderer.initialize();
+    await _remoteRenderer.initialize();
+    if (mounted) setState(() => _renderersReady = true);
+
+    if (widget.isCaller) {
+      _callStatus = 'ringing';
+      _makeCall();
+    } else {
+      _callStatus = 'incoming';
+      _listenForCallEnded();
+    }
+  }
+
+  Future<MediaStream> _getUserMedia() async {
+    final constraints = {
+      'audio': true,
+      'video': widget.isVideo
+          ? {
+              'facingMode': _isFrontCamera ? 'user' : 'environment',
+              'width': {'ideal': 640},
+              'height': {'ideal': 480},
+            }
+          : false,
+    };
+    return await navigator.mediaDevices.getUserMedia(constraints);
+  }
+
+  Future<RTCPeerConnection> _createPeerConnection() async {
+    final config = {
+      'iceServers': [
+        {'urls': 'stun:stun.l.google.com:19302'},
+        {'urls': 'stun:stun1.l.google.com:19302'},
+      ]
+    };
+    final conn = await createPeerConnection(config);
+
+    conn.onTrack = (RTCTrackEvent event) {
+      if (event.streams.isNotEmpty) {
+        setState(() {
+          _remoteStream = event.streams[0];
+          _remoteRenderer.srcObject = _remoteStream;
+          if (event.track.kind == 'video') _remoteVideoOn = true;
+        });
+      }
+    };
+
+    conn.onIceConnectionState = (RTCIceConnectionState state) {
+      if (state == RTCIceConnectionState.RTCIceConnectionStateConnected ||
+          state == RTCIceConnectionState.RTCIceConnectionStateCompleted) {
+        if (_callStatus != 'ongoing') {
+          _onCallConnected();
+        }
+      } else if (state == RTCIceConnectionState.RTCIceConnectionStateFailed) {
+        _endCall();
+      }
+    };
+
+    return conn;
+  }
+
+  void _onCallConnected() {
+    if (!mounted) return;
+    setState(() => _callStatus = 'ongoing');
+    _dbRef.child('calls').child(widget.callId).child('status').set('ongoing');
+    _startDurationTimer();
+    _startBitrateAdaptation();
+  }
+
+  void _startDurationTimer() {
+    _durationTimer?.cancel();
+    _durationTimer = Timer.periodic(const Duration(seconds: 1), (timer) {
+      if (mounted) setState(() => _durationSeconds++);
+    });
+  }
+
+  String _formatDuration(int seconds) {
+    final m = (seconds ~/ 60).toString().padLeft(2, '0');
+    final s = (seconds % 60).toString().padLeft(2, '0');
+    return '$m:$s';
+  }
+
+  // ---------------- Caller flow ----------------
+  Future<void> _makeCall() async {
+    try {
+      _localStream = await _getUserMedia();
+      _localRenderer.srcObject = _localStream;
+      if (mounted) setState(() {});
+
+      _peerConn = await _createPeerConnection();
+      for (var track in _localStream!.getTracks()) {
+        await _peerConn!.addTrack(track, _localStream!);
+      }
+
+      final signalRef = _dbRef.child('calls').child(widget.callId);
+
+      _peerConn!.onIceCandidate = (RTCIceCandidate candidate) {
+        if (candidate.candidate == null) return;
+        signalRef.child('callerCandidates').push().set(candidate.toMap());
+      };
+
+      RTCSessionDescription offer = await _peerConn!.createOffer({
+        'offerToReceiveAudio': true,
+        'offerToReceiveVideo': widget.isVideo,
+      });
+      await _peerConn!.setLocalDescription(offer);
+      await signalRef.child('offer').set({'sdp': offer.sdp, 'type': offer.type});
+
+      _answerSub = signalRef.child('answer').onValue.listen((event) async {
+        final data = event.snapshot.value as Map<dynamic, dynamic>?;
+        if (data != null && _peerConn != null) {
+          final existing = await _peerConn!.getRemoteDescription();
+          if (existing == null) {
+            await _peerConn!.setRemoteDescription(
+              RTCSessionDescription(data['sdp'], data['type']),
+            );
+          }
+        }
+      });
+
+      _remoteCandidatesSub =
+          signalRef.child('calleeCandidates').onChildAdded.listen((event) {
+        final data = event.snapshot.value as Map<dynamic, dynamic>?;
+        if (data != null) {
+          _peerConn!.addCandidate(RTCIceCandidate(
+            data['candidate'],
+            data['sdpMid'],
+            data['sdpMLineIndex'],
+          ));
+        }
+      });
+
+      _listenForCallEnded();
+    } catch (e) {
+      _endCall();
+    }
+  }
+
+  // ---------------- Callee flow ----------------
+  Future<void> _acceptCall() async {
+    try {
+      setState(() => _callStatus = 'connecting');
+      _localStream = await _getUserMedia();
+      _localRenderer.srcObject = _localStream;
+      if (mounted) setState(() {});
+
+      _peerConn = await _createPeerConnection();
+      for (var track in _localStream!.getTracks()) {
+        await _peerConn!.addTrack(track, _localStream!);
+      }
+
+      final signalRef = _dbRef.child('calls').child(widget.callId);
+
+      _peerConn!.onIceCandidate = (RTCIceCandidate candidate) {
+        if (candidate.candidate == null) return;
+        signalRef.child('calleeCandidates').push().set(candidate.toMap());
+      };
+
+      final offerSnap = await signalRef.child('offer').get();
+      if (!offerSnap.exists || offerSnap.value == null) {
+        _endCall();
+        return;
+      }
+      final offerData = offerSnap.value as Map<dynamic, dynamic>;
+      await _peerConn!.setRemoteDescription(
+        RTCSessionDescription(offerData['sdp'], offerData['type']),
+      );
+
+      RTCSessionDescription answer = await _peerConn!.createAnswer({
+        'offerToReceiveAudio': true,
+        'offerToReceiveVideo': widget.isVideo,
+      });
+      await _peerConn!.setLocalDescription(answer);
+      await signalRef.child('answer').set({'sdp': answer.sdp, 'type': answer.type});
+      await signalRef.child('status').set('accepted');
+
+      _remoteCandidatesSub =
+          signalRef.child('callerCandidates').onChildAdded.listen((event) {
+        final data = event.snapshot.value as Map<dynamic, dynamic>?;
+        if (data != null) {
+          _peerConn!.addCandidate(RTCIceCandidate(
+            data['candidate'],
+            data['sdpMid'],
+            data['sdpMLineIndex'],
+          ));
+        }
+      });
+    } catch (e) {
+      _endCall();
+    }
+  }
+
+  void _declineCall() {
+    _dbRef.child('calls').child(widget.callId).child('status').set('declined');
+    _cleanupAndPop();
+  }
+
+  void _listenForCallEnded() {
+    _callStatusSub = _dbRef
+        .child('calls')
+        .child(widget.callId)
+        .child('status')
+        .onValue
+        .listen((event) {
+      final status = event.snapshot.value;
+      if ((status == 'ended' || status == 'declined') && _callStatus != 'ended') {
+        _cleanupAndPop();
+      }
+    });
+  }
+
+  // ---------------- Controls ----------------
+  void _toggleMute() {
+    if (_localStream == null) return;
+    setState(() => _isMuted = !_isMuted);
+    for (var track in _localStream!.getAudioTracks()) {
+      track.enabled = !_isMuted;
+    }
+  }
+
+  void _toggleCamera() {
+    if (_localStream == null || !widget.isVideo) return;
+    setState(() => _isCameraOff = !_isCameraOff);
+    for (var track in _localStream!.getVideoTracks()) {
+      track.enabled = !_isCameraOff;
+    }
+  }
+
+  Future<void> _switchCamera() async {
+    if (_localStream == null || !widget.isVideo) return;
+    final videoTracks = _localStream!.getVideoTracks();
+    if (videoTracks.isEmpty) return;
+    await Helper.switchCamera(videoTracks.first);
+    setState(() => _isFrontCamera = !_isFrontCamera);
+  }
+
+  Future<void> _toggleSpeaker() async {
+    setState(() => _isSpeakerOn = !_isSpeakerOn);
+    await Helper.setSpeakerphoneOn(_isSpeakerOn);
+  }
+
+  // ---------------- Dynamic Bitrate Adaptation (DBA) ----------------
+  // Periodically inspects WebRTC stats (packet loss, RTT, available bandwidth)
+  // and adjusts the outgoing video encoding's max bitrate to match current
+  // network conditions, backing off on loss/latency and ramping up on a
+  // healthy link.
+  void _startBitrateAdaptation() {
+    if (!widget.isVideo || _peerConn == null) return;
+    _bitrateTimer?.cancel();
+    _bitrateTimer = Timer.periodic(const Duration(seconds: 3), (timer) async {
+      await _adaptBitrate();
+    });
+  }
+
+  Future<void> _adaptBitrate() async {
+    if (_peerConn == null) return;
+    try {
+      final stats = await _peerConn!.getStats();
+
+      double? packetsLost;
+      double? packetsSent;
+      double? roundTripTime;
+      double? availableOutgoingBitrate;
+
+      for (var report in stats) {
+        final values = report.values;
+        if (report.type == 'outbound-rtp' && values['kind'] == 'video') {
+          packetsSent = (values['packetsSent'] ?? 0).toDouble();
+        }
+        if (report.type == 'remote-inbound-rtp' && values['kind'] == 'video') {
+          packetsLost = (values['packetsLost'] ?? 0).toDouble();
+          final rtt = values['roundTripTime'];
+          if (rtt != null) roundTripTime = (rtt as num).toDouble();
+        }
+        if (report.type == 'candidate-pair' &&
+            (values['state'] == 'succeeded' || values['nominated'] == true) &&
+            values.containsKey('availableOutgoingBitrate')) {
+          availableOutgoingBitrate =
+              (values['availableOutgoingBitrate'] ?? 0).toDouble();
+        }
+      }
+
+      double lossRatio = 0;
+      if (packetsSent != null && packetsSent > 0 && packetsLost != null) {
+        lossRatio = packetsLost / (packetsSent + packetsLost);
+      }
+
+      double target = _currentVideoBitrate;
+
+      if (lossRatio > 0.08) {
+        // Heavy loss - back off aggressively
+        target = _currentVideoBitrate * 0.75;
+      } else if (lossRatio > 0.03) {
+        // Mild loss - trim a bit
+        target = _currentVideoBitrate * 0.9;
+      } else if (roundTripTime != null && roundTripTime > 0.4) {
+        // High latency - hold back slightly
+        target = _currentVideoBitrate * 0.95;
+      } else {
+        // Healthy link - ramp up gradually
+        target = _currentVideoBitrate * 1.1;
+        if (availableOutgoingBitrate != null && availableOutgoingBitrate > 0) {
+          final cap = availableOutgoingBitrate * 0.9;
+          if (target > cap) target = cap;
+        }
+      }
+
+      target = target.clamp(_minVideoBitrate, _maxVideoBitrate);
+
+      if ((target - _currentVideoBitrate).abs() > 20000) {
+        await _applyVideoBitrate(target);
+        _currentVideoBitrate = target;
+      }
+    } catch (e) {
+      // getStats() report keys can vary by platform/version - skip this cycle
+    }
+  }
+
+  Future<void> _applyVideoBitrate(double bitrate) async {
+    if (_peerConn == null) return;
+    final senders = await _peerConn!.getSenders();
+    for (var sender in senders) {
+      if (sender.track?.kind == 'video') {
+        RTCRtpParameters params = sender.parameters;
+        if (params.encodings == null || params.encodings!.isEmpty) {
+          params.encodings = [RTCRtpEncoding(active: true)];
+        }
+        for (var enc in params.encodings!) {
+          enc.maxBitrate = bitrate.toInt();
+          enc.minBitrate = _minVideoBitrate.toInt();
+        }
+        try {
+          await sender.setParameters(params);
+        } catch (_) {
+          // Some platforms reject setParameters mid-negotiation; ignore and retry next cycle
+        }
+      }
+    }
+  }
+
+  // ---------------- Cleanup ----------------
+  void _endCall() {
+    _dbRef.child('calls').child(widget.callId).child('status').set('ended');
+    _cleanupAndPop();
+  }
+
+  void _cleanupAndPop() {
+    if (_cleanedUp) return;
+    _cleanedUp = true;
+    _callStatus = 'ended';
+
+    _durationTimer?.cancel();
+    _bitrateTimer?.cancel();
+    _callStatusSub?.cancel();
+    _answerSub?.cancel();
+    _remoteCandidatesSub?.cancel();
+
+    _localStream?.getTracks().forEach((track) => track.stop());
+    _localStream?.dispose();
+    _remoteStream?.dispose();
+    _peerConn?.close();
+    _peerConn?.dispose();
+
+    if (mounted && Navigator.canPop(context)) {
+      Navigator.pop(context);
+    }
+  }
+
+  @override
+  void dispose() {
+    _durationTimer?.cancel();
+    _bitrateTimer?.cancel();
+    _callStatusSub?.cancel();
+    _answerSub?.cancel();
+    _remoteCandidatesSub?.cancel();
+    _localStream?.getTracks().forEach((track) => track.stop());
+    _localStream?.dispose();
+    _remoteStream?.dispose();
+    _peerConn?.close();
+    _peerConn?.dispose();
+    _localRenderer.dispose();
+    _remoteRenderer.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return WillPopScope(
+      onWillPop: () async {
+        if (_callStatus == 'incoming') {
+          _declineCall();
+        } else {
+          _endCall();
+        }
+        return false;
+      },
+      child: Scaffold(
+        backgroundColor: Colors.black,
+        body: SafeArea(
+          child: !_renderersReady
+              ? const Center(child: CircularProgressIndicator())
+              : Stack(
+                  children: [
+                    // Remote video / avatar background
+                    Positioned.fill(
+                      child: (widget.isVideo && _remoteVideoOn && _remoteStream != null)
+                          ? RTCVideoView(
+                              _remoteRenderer,
+                              objectFit:
+                                  RTCVideoViewObjectFit.RTCVideoViewObjectFitCover,
+                            )
+                          : Container(
+                              color: Colors.grey.shade900,
+                              child: const Center(
+                                child: CircleAvatar(
+                                  radius: 60,
+                                  child: Icon(Icons.person, size: 60),
+                                ),
+                              ),
+                            ),
+                    ),
+
+                    // Local preview (small, top-right)
+                    if (widget.isVideo && _localStream != null && !_isCameraOff)
+                      Positioned(
+                        top: 16,
+                        right: 16,
+                        child: Container(
+                          width: 110,
+                          height: 150,
+                          decoration: BoxDecoration(
+                            borderRadius: BorderRadius.circular(10),
+                            border: Border.all(color: Colors.white24),
+                          ),
+                          clipBehavior: Clip.hardEdge,
+                          child: RTCVideoView(
+                            _localRenderer,
+                            mirror: _isFrontCamera,
+                            objectFit:
+                                RTCVideoViewObjectFit.RTCVideoViewObjectFitCover,
+                          ),
+                        ),
+                      ),
+
+                    // Top status bar
+                    Positioned(
+                      top: 16,
+                      left: 16,
+                      child: Container(
+                        padding:
+                            const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                        decoration: BoxDecoration(
+                          color: Colors.black45,
+                          borderRadius: BorderRadius.circular(20),
+                        ),
+                        child: Text(
+                          _callStatus == 'ongoing'
+                              ? _formatDuration(_durationSeconds)
+                              : _callStatus == 'incoming'
+                                  ? 'Incoming ${widget.isVideo ? 'video' : 'voice'} call'
+                                  : _callStatus == 'ringing'
+                                      ? 'Ringing...'
+                                      : 'Connecting...',
+                          style: const TextStyle(color: Colors.white, fontSize: 13),
+                        ),
+                      ),
+                    ),
+
+                    // Bottom controls
+                    Positioned(
+                      left: 0,
+                      right: 0,
+                      bottom: 30,
+                      child: _callStatus == 'incoming'
+                          ? _buildIncomingControls()
+                          : _buildInCallControls(),
+                    ),
+                  ],
+                ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildIncomingControls() {
+    return Row(
+      mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+      children: [
+        Column(
+          children: [
+            FloatingActionButton(
+              heroTag: 'decline',
+              backgroundColor: Colors.red,
+              onPressed: _declineCall,
+              child: const Icon(Icons.call_end),
+            ),
+            const SizedBox(height: 6),
+            const Text('Decline', style: TextStyle(color: Colors.white, fontSize: 12)),
+          ],
+        ),
+        Column(
+          children: [
+            FloatingActionButton(
+              heroTag: 'accept',
+              backgroundColor: Colors.green,
+              onPressed: _acceptCall,
+              child: Icon(widget.isVideo ? Icons.videocam : Icons.call),
+            ),
+            const SizedBox(height: 6),
+            const Text('Accept', style: TextStyle(color: Colors.white, fontSize: 12)),
+          ],
+        ),
+      ],
+    );
+  }
+
+  Widget _buildInCallControls() {
+    return Row(
+      mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+      children: [
+        _controlButton(
+          icon: _isMuted ? Icons.mic_off : Icons.mic,
+          active: _isMuted,
+          onTap: _toggleMute,
+        ),
+        if (widget.isVideo)
+          _controlButton(
+            icon: _isCameraOff ? Icons.videocam_off : Icons.videocam,
+            active: _isCameraOff,
+            onTap: _toggleCamera,
+          ),
+        if (widget.isVideo)
+          _controlButton(
+            icon: Icons.cameraswitch,
+            active: false,
+            onTap: _switchCamera,
+          ),
+        _controlButton(
+          icon: _isSpeakerOn ? Icons.volume_up : Icons.hearing,
+          active: _isSpeakerOn,
+          onTap: _toggleSpeaker,
+        ),
+        FloatingActionButton(
+          heroTag: 'endCall',
+          backgroundColor: Colors.red,
+          onPressed: _endCall,
+          child: const Icon(Icons.call_end),
+        ),
+      ],
+    );
+  }
+
+  Widget _controlButton({
+    required IconData icon,
+    required bool active,
+    required VoidCallback onTap,
+  }) {
+    return CircleAvatar(
+      radius: 26,
+      backgroundColor: active ? Colors.white : Colors.white24,
+      child: IconButton(
+        icon: Icon(icon, color: active ? Colors.black : Colors.white),
+        onPressed: onTap,
+      ),
+    );
+  }
+}
