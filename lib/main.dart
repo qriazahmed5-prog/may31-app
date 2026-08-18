@@ -114,6 +114,12 @@ Future<List<Map<String, dynamic>>> getMatchedAppUsers(String currentUid) async {
   return matched;
 }
 
+Future<bool> isUserBlocked(String myUid, String otherUid) async {
+  final dbRef = FirebaseDatabase.instance.ref();
+  final snap = await dbRef.child('users').child(myUid).child('blocked').child(otherUid).get();
+  return snap.exists && snap.value == true;
+}
+
 Widget avatarWidget(String? photoBase64, {double radius = 20, IconData fallback = Icons.person}) {
   if (photoBase64 != null && photoBase64.isNotEmpty) {
     try {
@@ -256,6 +262,10 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
       final data = event.snapshot.value as Map<dynamic, dynamic>?;
       if (data == null) return;
       if (data['calleeId'] == currentUid && data['status'] == 'ringing') {
+        final callerId = data['callerId'];
+        final blocked = await isUserBlocked(currentUid, callerId);
+        if (blocked) return;
+
         final callId = event.snapshot.key!;
 
         _isRinging = true;
@@ -328,11 +338,17 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
                   context,
                   MaterialPageRoute(builder: (context) => const SettingsScreen()),
                 );
+              } else if (value == 'blocked') {
+                Navigator.push(
+                  context,
+                  MaterialPageRoute(builder: (context) => const BlockedUsersScreen()),
+                );
               }
             },
             itemBuilder: (context) => [
               const PopupMenuItem(value: 'profile', child: Text('My Profile')),
               const PopupMenuItem(value: 'settings', child: Text('Settings')),
+              const PopupMenuItem(value: 'blocked', child: Text('Blocked Users')),
               const PopupMenuItem(value: 'privacy', child: Text('Privacy Policy')),
               const PopupMenuItem(value: 'about', child: Text('About')),
             ],
@@ -345,6 +361,64 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
           ChatsTabContent(),
           GroupsTabContent(),
         ],
+      ),
+    );
+  }
+}
+
+// ---------------- Blocked Users Screen ----------------
+class BlockedUsersScreen extends StatefulWidget {
+  const BlockedUsersScreen({super.key});
+
+  @override
+  State<BlockedUsersScreen> createState() => _BlockedUsersScreenState();
+}
+
+class _BlockedUsersScreenState extends State<BlockedUsersScreen> {
+  final currentUid = FirebaseAuth.instance.currentUser?.uid ?? '';
+  final dbRef = FirebaseDatabase.instance.ref();
+
+  Future<void> _unblock(String uid) async {
+    await dbRef.child('users').child(currentUid).child('blocked').child(uid).remove();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('Blocked Users')),
+      body: StreamBuilder(
+        stream: dbRef.child('users').child(currentUid).child('blocked').onValue,
+        builder: (context, AsyncSnapshot<DatabaseEvent> snapshot) {
+          if (!snapshot.hasData || snapshot.data!.snapshot.value == null) {
+            return const Center(child: Text('No blocked users'));
+          }
+          Map<dynamic, dynamic> blockedMap =
+              snapshot.data!.snapshot.value as Map<dynamic, dynamic>;
+          List<String> uids = blockedMap.keys.map((e) => e.toString()).toList();
+
+          return ListView.builder(
+            itemCount: uids.length,
+            itemBuilder: (context, index) {
+              final uid = uids[index];
+              return FutureBuilder(
+                future: dbRef.child('users').child(uid).child('phone').get(),
+                builder: (context, AsyncSnapshot<DataSnapshot> phoneSnap) {
+                  String phone = phoneSnap.hasData && phoneSnap.data!.value != null
+                      ? phoneSnap.data!.value.toString()
+                      : 'Unknown';
+                  return ListTile(
+                    leading: const CircleAvatar(child: Icon(Icons.block)),
+                    title: Text(phone),
+                    trailing: TextButton(
+                      onPressed: () => _unblock(uid),
+                      child: const Text('Unblock'),
+                    ),
+                  );
+                },
+              );
+            },
+          );
+        },
       ),
     );
   }
@@ -924,6 +998,59 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
     });
   }
 
+  Future<void> _deleteMessage(String key, bool forEveryone) async {
+    if (forEveryone) {
+      await _dbRef.child('groups').child(widget.groupId).child('messages').child(key).remove();
+    } else {
+      await _dbRef
+          .child('groups')
+          .child(widget.groupId)
+          .child('messages')
+          .child(key)
+          .child('deletedFor')
+          .child(currentUid)
+          .set(true);
+    }
+  }
+
+  void _showMessageOptions(String key, Map item) {
+    bool isMe = item['sender'] == currentUid;
+    showModalBottomSheet(
+      context: context,
+      builder: (context) => SafeArea(
+        child: Wrap(
+          children: [
+            ListTile(
+              leading: const Icon(Icons.reply),
+              title: const Text('Reply'),
+              onTap: () {
+                Navigator.pop(context);
+                _setReply(item);
+              },
+            ),
+            ListTile(
+              leading: const Icon(Icons.delete_outline),
+              title: const Text('Delete for me'),
+              onTap: () {
+                Navigator.pop(context);
+                _deleteMessage(key, false);
+              },
+            ),
+            if (isMe)
+              ListTile(
+                leading: const Icon(Icons.delete_forever, color: Colors.red),
+                title: const Text('Delete for everyone'),
+                onTap: () {
+                  Navigator.pop(context);
+                  _deleteMessage(key, true);
+                },
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+
   @override
   void dispose() {
     _notifPlayer.dispose();
@@ -1002,25 +1129,31 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
                 if (snapshot.hasData && snapshot.data!.snapshot.value != null) {
                   Map<dynamic, dynamic> map =
                       snapshot.data!.snapshot.value as Map<dynamic, dynamic>;
-                  List<dynamic> list = map.values.toList();
-                  list.sort((a, b) =>
-                      (a['timestamp'] ?? 0).compareTo(b['timestamp'] ?? 0));
+                  List<MapEntry<dynamic, dynamic>> entries = map.entries.toList();
+                  entries.sort((a, b) => (a.value['timestamp'] ?? 0)
+                      .compareTo(b.value['timestamp'] ?? 0));
 
-                  if (list.length > _lastMessageCount && _lastMessageCount != 0) {
-                    var lastMsg = list.last;
+                  entries = entries.where((e) {
+                    final deletedFor = e.value['deletedFor'] as Map<dynamic, dynamic>?;
+                    return deletedFor == null || deletedFor[currentUid] != true;
+                  }).toList();
+
+                  if (entries.length > _lastMessageCount && _lastMessageCount != 0) {
+                    var lastMsg = entries.last.value;
                     if (lastMsg['sender'] != currentUid) {
                       _notifPlayer.play(AssetSource('sounds/iphone.mp3'));
                     }
                   }
-                  _lastMessageCount = list.length;
+                  _lastMessageCount = entries.length;
 
                   return ListView.builder(
-                    itemCount: list.length,
+                    itemCount: entries.length,
                     itemBuilder: (context, index) {
-                      var item = list[index];
+                      var key = entries[index].key.toString();
+                      var item = entries[index].value;
                       bool isMe = item['sender'] == currentUid;
                       return GestureDetector(
-                        onLongPress: () => _setReply(item),
+                        onLongPress: () => _showMessageOptions(key, item),
                         child: Align(
                           alignment:
                               isMe ? Alignment.centerRight : Alignment.centerLeft,
@@ -1535,6 +1668,9 @@ class PrivacyPolicyScreen extends StatelessWidget {
               Text('• Phone Number: Your phone number is used only for account verification and to let your contacts find you on this app.',
                   style: TextStyle(fontSize: 14)),
               SizedBox(height: 8),
+              Text('• Blocking: If you block a contact, they will no longer be able to send you messages or call you.',
+                  style: TextStyle(fontSize: 14)),
+              SizedBox(height: 8),
               Text('• Profile & Group Photos: Stored securely to display within the app to your contacts and group members.',
                   style: TextStyle(fontSize: 14)),
               SizedBox(height: 8),
@@ -1744,6 +1880,8 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   bool _screenIsActive = true;
   bool _showEmojiPicker = false;
   bool _peerTyping = false;
+  bool _iBlockedPeer = false;
+  bool _checkedBlockStatus = false;
 
   String? _replyToId;
   String? _replyToText;
@@ -1771,8 +1909,39 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     _setupFileChannel();
     _listenForTyping();
     _msgController.addListener(_onTextChanged);
-    // Unhide chat when opened
+    _checkBlockStatus();
     _dbRef.child('users').child(currentUid).child('hiddenChats').child(chatId).remove();
+  }
+
+  Future<void> _checkBlockStatus() async {
+    final blocked = await isUserBlocked(currentUid, widget.peerUid);
+    if (mounted) {
+      setState(() {
+        _iBlockedPeer = blocked;
+        _checkedBlockStatus = true;
+      });
+    }
+  }
+
+  Future<void> _toggleBlock() async {
+    if (_iBlockedPeer) {
+      await _dbRef.child('users').child(currentUid).child('blocked').child(widget.peerUid).remove();
+    } else {
+      final confirm = await showDialog<bool>(
+        context: context,
+        builder: (context) => AlertDialog(
+          title: const Text('Block this contact?'),
+          content: const Text('They will no longer be able to message or call you.'),
+          actions: [
+            TextButton(onPressed: () => Navigator.pop(context, false), child: const Text('Cancel')),
+            TextButton(onPressed: () => Navigator.pop(context, true), child: const Text('Block')),
+          ],
+        ),
+      );
+      if (confirm != true) return;
+      await _dbRef.child('users').child(currentUid).child('blocked').child(widget.peerUid).set(true);
+    }
+    setState(() => _iBlockedPeer = !_iBlockedPeer);
   }
 
   void _onTextChanged() {
@@ -2147,6 +2316,12 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   }
 
   void _sendMessage() {
+    if (_iBlockedPeer) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Unblock this contact to send messages')),
+      );
+      return;
+    }
     if (_msgController.text.trim().isNotEmpty) {
       final msgData = {
         'sender': currentUid,
@@ -2188,7 +2363,66 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     });
   }
 
+  Future<void> _deleteMessage(String key, bool forEveryone) async {
+    if (forEveryone) {
+      await _dbRef.child('chats').child(chatId).child('messages').child(key).remove();
+    } else {
+      await _dbRef
+          .child('chats')
+          .child(chatId)
+          .child('messages')
+          .child(key)
+          .child('deletedFor')
+          .child(currentUid)
+          .set(true);
+    }
+  }
+
+  void _showMessageOptions(String key, Map item) {
+    bool isMe = item['sender'] == currentUid;
+    showModalBottomSheet(
+      context: context,
+      builder: (context) => SafeArea(
+        child: Wrap(
+          children: [
+            ListTile(
+              leading: const Icon(Icons.reply),
+              title: const Text('Reply'),
+              onTap: () {
+                Navigator.pop(context);
+                _setReply(item);
+              },
+            ),
+            ListTile(
+              leading: const Icon(Icons.delete_outline),
+              title: const Text('Delete for me'),
+              onTap: () {
+                Navigator.pop(context);
+                _deleteMessage(key, false);
+              },
+            ),
+            if (isMe)
+              ListTile(
+                leading: const Icon(Icons.delete_forever, color: Colors.red),
+                title: const Text('Delete for everyone'),
+                onTap: () {
+                  Navigator.pop(context);
+                  _deleteMessage(key, true);
+                },
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+
   void _startCall(bool isVideo) async {
+    if (_iBlockedPeer) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Unblock this contact to call them')),
+      );
+      return;
+    }
     final callRef = _dbRef.child('calls').push();
     await callRef.set({
       'callerId': currentUid,
@@ -2431,10 +2665,33 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
             icon: const Icon(Icons.videocam),
             onPressed: () => _startCall(true),
           ),
+          if (_checkedBlockStatus)
+            PopupMenuButton<String>(
+              onSelected: (value) {
+                if (value == 'block') _toggleBlock();
+              },
+              itemBuilder: (context) => [
+                PopupMenuItem(
+                  value: 'block',
+                  child: Text(_iBlockedPeer ? 'Unblock' : 'Block'),
+                ),
+              ],
+            ),
         ],
       ),
       body: Column(
         children: [
+          if (_iBlockedPeer)
+            Container(
+              width: double.infinity,
+              color: Colors.red.shade50,
+              padding: const EdgeInsets.symmetric(vertical: 6),
+              child: const Text(
+                'You have blocked this contact',
+                textAlign: TextAlign.center,
+                style: TextStyle(fontSize: 12, color: Colors.red),
+              ),
+            ),
           if (!_fileChannelReady)
             Container(
               width: double.infinity,
@@ -2453,16 +2710,23 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                 if (snapshot.hasData && snapshot.data!.snapshot.value != null) {
                   Map<dynamic, dynamic> map =
                       snapshot.data!.snapshot.value as Map<dynamic, dynamic>;
-                  List<dynamic> list = map.values.toList();
-                  list.sort((a, b) =>
-                      (a['timestamp'] ?? 0).compareTo(b['timestamp'] ?? 0));
+                  List<MapEntry<dynamic, dynamic>> entries = map.entries.toList();
+                  entries.sort((a, b) => (a.value['timestamp'] ?? 0)
+                      .compareTo(b.value['timestamp'] ?? 0));
+
+                  entries = entries.where((e) {
+                    final deletedFor = e.value['deletedFor'] as Map<dynamic, dynamic>?;
+                    return deletedFor == null || deletedFor[currentUid] != true;
+                  }).toList();
+
                   return ListView.builder(
-                    itemCount: list.length,
+                    itemCount: entries.length,
                     itemBuilder: (context, index) {
-                      var item = list[index];
+                      var key = entries[index].key.toString();
+                      var item = entries[index].value;
                       bool isMe = item['sender'] == currentUid;
                       return GestureDetector(
-                        onLongPress: () => _setReply(item),
+                        onLongPress: () => _showMessageOptions(key, item),
                         child: Align(
                           alignment:
                               isMe ? Alignment.centerRight : Alignment.centerLeft,
@@ -2638,187 +2902,4 @@ class CallScreen extends StatefulWidget {
     super.key,
     required this.callId,
     required this.peerUid,
-    required this.isVideo,
-    required this.isCaller,
-  });
-
-  @override
-  State<CallScreen> createState() => _CallScreenState();
-}
-
-class _CallScreenState extends State<CallScreen> {
-  final DatabaseReference _dbRef = FirebaseDatabase.instance.ref();
-  final _localRenderer = RTCVideoRenderer();
-  final _remoteRenderer = RTCVideoRenderer();
-  final AudioPlayer _outgoingRingPlayer = AudioPlayer();
-  RTCPeerConnection? _peerConnection;
-  MediaStream? _localStream;
-  String _status = 'Connecting...';
-
-  final Map<String, dynamic> _config = {
-    'iceServers': [
-      {'urls': 'stun:stun.l.google.com:19302'},
-    ]
-  };
-
-  @override
-  void initState() {
-    super.initState();
-    _setup();
-    if (widget.isCaller) {
-      _outgoingRingPlayer.setReleaseMode(ReleaseMode.loop);
-      _outgoingRingPlayer.play(AssetSource('sounds/nokia.mp3'));
-    }
-  }
-
-  Future<void> _setup() async {
-    await _localRenderer.initialize();
-    await _remoteRenderer.initialize();
-
-    _localStream = await navigator.mediaDevices.getUserMedia({
-      'audio': true,
-      'video': widget.isVideo ? {'facingMode': 'user'} : false,
-    });
-    _localRenderer.srcObject = _localStream;
-
-    _peerConnection = await createPeerConnection(_config);
-
-    for (var track in _localStream!.getTracks()) {
-      await _peerConnection!.addTrack(track, _localStream!);
-    }
-
-    _peerConnection!.onTrack = (RTCTrackEvent event) {
-      if (event.streams.isNotEmpty) {
-        _remoteRenderer.srcObject = event.streams[0];
-        _outgoingRingPlayer.stop();
-        setState(() => _status = 'Connected');
-      }
-    };
-
-    final callRef = _dbRef.child('calls').child(widget.callId);
-
-    _peerConnection!.onIceCandidate = (RTCIceCandidate candidate) {
-      final path = widget.isCaller ? 'callerCandidates' : 'calleeCandidates';
-      callRef.child(path).push().set(candidate.toMap());
-    };
-
-    if (widget.isCaller) {
-      RTCSessionDescription offer = await _peerConnection!.createOffer();
-      await _peerConnection!.setLocalDescription(offer);
-      await callRef.child('offer').set({
-        'sdp': offer.sdp,
-        'type': offer.type,
-      });
-
-      callRef.child('answer').onValue.listen((event) async {
-        final data = event.snapshot.value as Map<dynamic, dynamic>?;
-        if (data != null && _peerConnection!.getRemoteDescription() == null) {
-          RTCSessionDescription answer =
-              RTCSessionDescription(data['sdp'], data['type']);
-          await _peerConnection!.setRemoteDescription(answer);
-        }
-      });
-
-      callRef.child('calleeCandidates').onChildAdded.listen((event) {
-        final data = event.snapshot.value as Map<dynamic, dynamic>?;
-        if (data != null) {
-          _peerConnection!.addCandidate(RTCIceCandidate(
-            data['candidate'],
-            data['sdpMid'],
-            data['sdpMLineIndex'],
-          ));
-        }
-      });
-    } else {
-      callRef.child('offer').onValue.listen((event) async {
-        final data = event.snapshot.value as Map<dynamic, dynamic>?;
-        if (data != null && _peerConnection!.getRemoteDescription() == null) {
-          RTCSessionDescription offer =
-              RTCSessionDescription(data['sdp'], data['type']);
-          await _peerConnection!.setRemoteDescription(offer);
-
-          RTCSessionDescription answer = await _peerConnection!.createAnswer();
-          await _peerConnection!.setLocalDescription(answer);
-          await callRef.child('answer').set({
-            'sdp': answer.sdp,
-            'type': answer.type,
-          });
-        }
-      });
-
-      callRef.child('callerCandidates').onChildAdded.listen((event) {
-        final data = event.snapshot.value as Map<dynamic, dynamic>?;
-        if (data != null) {
-          _peerConnection!.addCandidate(RTCIceCandidate(
-            data['candidate'],
-            data['sdpMid'],
-            data['sdpMLineIndex'],
-          ));
-        }
-      });
-    }
-
-    await callRef.child('status').set('active');
-  }
-
-  void _endCall() async {
-    await _outgoingRingPlayer.stop();
-    await _dbRef.child('calls').child(widget.callId).remove();
-    _localStream?.getTracks().forEach((track) => track.stop());
-    await _peerConnection?.close();
-    if (mounted) Navigator.pop(context);
-  }
-
-  @override
-  void dispose() {
-    _localRenderer.dispose();
-    _remoteRenderer.dispose();
-    _outgoingRingPlayer.dispose();
-    _localStream?.getTracks().forEach((track) => track.stop());
-    _peerConnection?.close();
-    super.dispose();
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return Scaffold(
-      backgroundColor: Colors.black,
-      body: Stack(
-        children: [
-          if (widget.isVideo)
-            Positioned.fill(
-              child: RTCVideoView(_remoteRenderer,
-                  objectFit: RTCVideoViewObjectFit.RTCVideoViewObjectFitCover),
-            )
-          else
-            Center(
-              child: Text(
-                _status,
-                style: const TextStyle(color: Colors.white, fontSize: 20),
-              ),
-            ),
-          if (widget.isVideo)
-            Positioned(
-              top: 40,
-              right: 20,
-              width: 100,
-              height: 150,
-              child: RTCVideoView(_localRenderer, mirror: true),
-            ),
-          Positioned(
-            bottom: 40,
-            left: 0,
-            right: 0,
-            child: Center(
-              child: FloatingActionButton(
-                backgroundColor: Colors.red,
-                onPressed: _endCall,
-                child: const Icon(Icons.call_end),
-              ),
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-}
+    required this.isVideo
