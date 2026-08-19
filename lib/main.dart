@@ -273,8 +273,6 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
         await _ringPlayer.setReleaseMode(ReleaseMode.loop);
         await _ringPlayer.play(AssetSource('sounds/nokia.mp3'));
 
-        // Stop ringtone as soon as this call's status changes away from 'ringing'
-        // (accepted, declined, or ended) instead of waiting for the screen to close.
         StreamSubscription? statusSub;
         statusSub = dbRef
             .child('calls')
@@ -962,7 +960,137 @@ class _JoinGroupScreenState extends State<JoinGroupScreen> {
   }
 }
 
-// ---------------- Group Chat Screen ----------------
+// ---------------- Voice Message Bubble Widget ----------------
+class VoiceMessageBubble extends StatefulWidget {
+  final String filePath;
+  const VoiceMessageBubble({super.key, required this.filePath});
+
+  @override
+  State<VoiceMessageBubble> createState() => _VoiceMessageBubbleState();
+}
+
+class _VoiceMessageBubbleState extends State<VoiceMessageBubble> {
+  final AudioPlayer _player = AudioPlayer();
+  bool _isPlaying = false;
+  Duration _duration = Duration.zero;
+  Duration _position = Duration.zero;
+
+  @override
+  void initState() {
+    super.initState();
+    _player.onDurationChanged.listen((d) {
+      if (mounted) setState(() => _duration = d);
+    });
+    _player.onPositionChanged.listen((p) {
+      if (mounted) setState(() => _position = p);
+    });
+    _player.onPlayerComplete.listen((_) {
+      if (mounted) setState(() => _isPlaying = false);
+    });
+  }
+
+  void _togglePlay() async {
+    if (_isPlaying) {
+      await _player.pause();
+      setState(() => _isPlaying = false);
+    } else {
+      await _player.play(DeviceFileSource(widget.filePath));
+      setState(() => _isPlaying = true);
+    }
+  }
+
+  String _fmt(Duration d) {
+    String twoDigits(int n) => n.toString().padLeft(2, '0');
+    return '${twoDigits(d.inMinutes)}:${twoDigits(d.inSeconds % 60)}';
+  }
+
+  @override
+  void dispose() {
+    _player.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        IconButton(
+          icon: Icon(_isPlaying ? Icons.pause_circle : Icons.play_circle,
+              size: 32, color: Colors.teal),
+          onPressed: _togglePlay,
+        ),
+        Text(
+          _duration.inMilliseconds > 0
+              ? '${_fmt(_position)} / ${_fmt(_duration)}'
+              : 'Voice message',
+          style: const TextStyle(fontSize: 12),
+        ),
+      ],
+    );
+  }
+}
+
+// ---------------- Inline Video Player Page ----------------
+class VideoPlayerPage extends StatefulWidget {
+  final String filePath;
+  const VideoPlayerPage({super.key, required this.filePath});
+
+  @override
+  State<VideoPlayerPage> createState() => _VideoPlayerPageState();
+}
+
+class _VideoPlayerPageState extends State<VideoPlayerPage> {
+  late VideoPlayerController _controller;
+  bool _initialized = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _controller = VideoPlayerController.file(File(widget.filePath))
+      ..initialize().then((_) {
+        if (mounted) {
+          setState(() => _initialized = true);
+          _controller.play();
+        }
+      });
+  }
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: Colors.black,
+      appBar: AppBar(backgroundColor: Colors.black, foregroundColor: Colors.white),
+      body: Center(
+        child: _initialized
+            ? AspectRatio(
+                aspectRatio: _controller.value.aspectRatio,
+                child: VideoPlayer(_controller),
+              )
+            : const CircularProgressIndicator(),
+      ),
+      floatingActionButton: _initialized
+          ? FloatingActionButton(
+              onPressed: () {
+                setState(() {
+                  _controller.value.isPlaying ? _controller.pause() : _controller.play();
+                });
+              },
+              child:
+                  Icon(_controller.value.isPlaying ? Icons.pause : Icons.play_arrow),
+            )
+          : null,
+    );
+  }
+}
+
+// ---------------- Group Chat Screen (with P2P mesh media sharing) ----------------
 class GroupChatScreen extends StatefulWidget {
   final String groupId;
   const GroupChatScreen({super.key, required this.groupId});
@@ -981,6 +1109,352 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
 
   String? _replyToText;
   String? _replyToSender;
+
+  // ---- P2P mesh for media sharing ----
+  final Map<String, RTCPeerConnection> _peerConns = {};
+  final Map<String, RTCDataChannel> _dataChannels = {};
+  final Map<String, bool> _channelReady = {};
+  StreamSubscription? _presenceSub;
+  StreamSubscription? _membersSub;
+  Set<String> _presentMembers = {};
+  List<String> _allMemberUids = [];
+
+  final Map<String, List<Uint8List?>> _recvChunks = {};
+  final Map<String, Map<String, dynamic>> _recvMeta = {};
+  final Map<String, String> _localFilePaths = {};
+
+  @override
+  void initState() {
+    super.initState();
+    _setupPresenceAndMesh();
+  }
+
+  void _setupPresenceAndMesh() async {
+    // Mark self as present in this group chat
+    final presenceRef = _dbRef.child('groups').child(widget.groupId).child('presence').child(currentUid);
+    await presenceRef.set(true);
+    presenceRef.onDisconnect().remove();
+
+    // Load member list once
+    final groupSnap = await _dbRef.child('groups').child(widget.groupId).child('members').get();
+    if (groupSnap.exists && groupSnap.value != null) {
+      Map<dynamic, dynamic> map = groupSnap.value as Map<dynamic, dynamic>;
+      _allMemberUids = map.keys.map((e) => e.toString()).where((u) => u != currentUid).toList();
+    }
+
+    // Listen for who else is currently present -> establish P2P connection with them
+    _presenceSub = _dbRef
+        .child('groups')
+        .child(widget.groupId)
+        .child('presence')
+        .onValue
+        .listen((event) {
+      if (event.snapshot.value == null) return;
+      Map<dynamic, dynamic> map = event.snapshot.value as Map<dynamic, dynamic>;
+      Set<String> present = map.keys.map((e) => e.toString()).where((u) => u != currentUid).toSet();
+
+      for (var uid in present) {
+        if (!_presentMembers.contains(uid) && !_peerConns.containsKey(uid)) {
+          _connectToPeer(uid);
+        }
+      }
+      _presentMembers = present;
+    });
+
+    _listenForNewMessages();
+  }
+
+  void _connectToPeer(String peerUid) async {
+    final conn = await createPeerConnection({
+      'iceServers': [
+        {'urls': 'stun:stun.l.google.com:19302'},
+      ]
+    });
+    _peerConns[peerUid] = conn;
+    _channelReady[peerUid] = false;
+
+    List<String> pairIds = [currentUid, peerUid];
+    pairIds.sort();
+    String pairKey = '${pairIds[0]}_${pairIds[1]}';
+    final signalRef = _dbRef.child('groups').child(widget.groupId).child('fileSignal').child(pairKey);
+
+    bool isInitiator = currentUid.compareTo(peerUid) < 0;
+
+    conn.onIceCandidate = (RTCIceCandidate candidate) {
+      final path = isInitiator ? 'callerCandidates' : 'calleeCandidates';
+      signalRef.child(path).push().set(candidate.toMap());
+    };
+
+    if (isInitiator) {
+      await signalRef.remove();
+
+      final channel = await conn.createDataChannel(
+        'groupFileChannel',
+        RTCDataChannelInit()..ordered = true,
+      );
+      _dataChannels[peerUid] = channel;
+      channel.onMessage = (msg) => _handleDataChannelMessage(msg);
+      channel.onDataChannelState = (state) {
+        if (mounted) {
+          setState(() {
+            _channelReady[peerUid] = state == RTCDataChannelState.RTCDataChannelOpen;
+          });
+        }
+      };
+
+      RTCSessionDescription offer = await conn.createOffer();
+      await conn.setLocalDescription(offer);
+      await signalRef.child('offer').set({'sdp': offer.sdp, 'type': offer.type});
+
+      signalRef.child('answer').onValue.listen((event) async {
+        final data = event.snapshot.value as Map<dynamic, dynamic>?;
+        if (data != null && await conn.getRemoteDescription() == null) {
+          await conn.setRemoteDescription(RTCSessionDescription(data['sdp'], data['type']));
+        }
+      });
+
+      signalRef.child('calleeCandidates').onChildAdded.listen((event) {
+        final data = event.snapshot.value as Map<dynamic, dynamic>?;
+        if (data != null) {
+          conn.addCandidate(RTCIceCandidate(data['candidate'], data['sdpMid'], data['sdpMLineIndex']));
+        }
+      });
+    } else {
+      conn.onDataChannel = (channel) {
+        _dataChannels[peerUid] = channel;
+        channel.onMessage = (msg) => _handleDataChannelMessage(msg);
+        channel.onDataChannelState = (state) {
+          if (mounted) {
+            setState(() {
+              _channelReady[peerUid] = state == RTCDataChannelState.RTCDataChannelOpen;
+            });
+          }
+        };
+      };
+
+      signalRef.child('offer').onValue.listen((event) async {
+        final data = event.snapshot.value as Map<dynamic, dynamic>?;
+        if (data != null && await conn.getRemoteDescription() == null) {
+          await conn.setRemoteDescription(RTCSessionDescription(data['sdp'], data['type']));
+          RTCSessionDescription answer = await conn.createAnswer();
+          await conn.setLocalDescription(answer);
+          await signalRef.child('answer').set({'sdp': answer.sdp, 'type': answer.type});
+        }
+      });
+
+      signalRef.child('callerCandidates').onChildAdded.listen((event) {
+        final data = event.snapshot.value as Map<dynamic, dynamic>?;
+        if (data != null) {
+          conn.addCandidate(RTCIceCandidate(data['candidate'], data['sdpMid'], data['sdpMLineIndex']));
+        }
+      });
+    }
+  }
+
+  void _handleDataChannelMessage(RTCDataChannelMessage message) async {
+    if (message.isBinary) return;
+    final data = jsonDecode(message.text);
+
+    if (data['t'] == 'meta') {
+      final id = data['id'];
+      _recvMeta[id] = data;
+      _recvChunks[id] = List<Uint8List?>.filled(data['total'], null);
+    } else if (data['t'] == 'chunk') {
+      final id = data['id'];
+      final i = data['i'];
+      final bytes = base64Decode(data['d']);
+      if (_recvChunks[id] == null) return;
+      _recvChunks[id]![i] = bytes;
+
+      bool complete = _recvChunks[id]!.every((e) => e != null);
+      if (complete) {
+        final meta = _recvMeta[id]!;
+        final builder = BytesBuilder();
+        for (var c in _recvChunks[id]!) {
+          builder.add(c!);
+        }
+        final finalBytes = builder.toBytes();
+        final dir = await getApplicationDocumentsDirectory();
+        final localFile = File('${dir.path}/${meta['name']}');
+        await localFile.writeAsBytes(finalBytes);
+
+        if (mounted) {
+          setState(() {
+            _localFilePaths[id] = localFile.path;
+          });
+        }
+        _recvChunks.remove(id);
+        _recvMeta.remove(id);
+      }
+    }
+  }
+
+  Future<void> _sendFileBytes(Uint8List bytes, String fileName, String mime) async {
+    final readyPeers = _dataChannels.entries
+        .where((e) =>
+            _channelReady[e.key] == true && e.value.state == RTCDataChannelState.RTCDataChannelOpen)
+        .toList();
+
+    if (readyPeers.isEmpty) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('No group members are currently online to receive this file.'),
+          ),
+        );
+      }
+    }
+
+    String fileId = DateTime.now().millisecondsSinceEpoch.toString();
+    const chunkSize = 16000;
+    int total = (bytes.length / chunkSize).ceil();
+    String kind = mime.startsWith('image/')
+        ? 'image'
+        : mime.startsWith('video/')
+            ? 'video'
+            : mime.startsWith('audio/')
+                ? 'voice'
+                : 'file';
+
+    final metaMsg = jsonEncode({
+      't': 'meta',
+      'id': fileId,
+      'name': fileName,
+      'size': bytes.length,
+      'mime': mime,
+      'total': total,
+    });
+
+    for (var entry in readyPeers) {
+      entry.value.send(RTCDataChannelMessage(metaMsg));
+    }
+
+    for (int i = 0; i < total; i++) {
+      int start = i * chunkSize;
+      int end = (start + chunkSize > bytes.length) ? bytes.length : start + chunkSize;
+      Uint8List chunk = bytes.sublist(start, end);
+      String b64 = base64Encode(chunk);
+      final chunkMsg = jsonEncode({'t': 'chunk', 'id': fileId, 'i': i, 'd': b64});
+
+      for (var entry in readyPeers) {
+        entry.value.send(RTCDataChannelMessage(chunkMsg));
+      }
+      await Future.delayed(const Duration(milliseconds: 8));
+    }
+
+    final dir = await getApplicationDocumentsDirectory();
+    final localFile = File('${dir.path}/$fileName');
+    await localFile.writeAsBytes(bytes);
+    if (mounted) {
+      setState(() {
+        _localFilePaths[fileId] = localFile.path;
+      });
+    }
+
+    final myPhone = FirebaseAuth.instance.currentUser?.phoneNumber ?? '';
+    _dbRef.child('groups').child(widget.groupId).child('messages').push().set({
+      'sender': currentUid,
+      'senderPhone': myPhone,
+      'type': kind,
+      'fileId': fileId,
+      'fileName': fileName,
+      'timestamp': DateTime.now().millisecondsSinceEpoch,
+    });
+  }
+
+  String _guessMime(String name) {
+    final ext = name.split('.').last.toLowerCase();
+    if (['jpg', 'jpeg', 'png', 'gif', 'webp'].contains(ext)) return 'image/$ext';
+    if (['mp4', 'mov', 'mkv', 'avi'].contains(ext)) return 'video/$ext';
+    return 'application/octet-stream';
+  }
+
+  void _pickImageOrVideo() async {
+    final picker = ImagePicker();
+    final XFile? picked = await showModalBottomSheet<XFile?>(
+      context: context,
+      builder: (context) => SafeArea(
+        child: Wrap(
+          children: [
+            ListTile(
+              leading: const Icon(Icons.photo),
+              title: const Text('Photo from Gallery'),
+              onTap: () async {
+                final f = await picker.pickImage(source: ImageSource.gallery);
+                if (mounted) Navigator.pop(context, f);
+              },
+            ),
+            ListTile(
+              leading: const Icon(Icons.videocam),
+              title: const Text('Video from Gallery'),
+              onTap: () async {
+                final f = await picker.pickVideo(source: ImageSource.gallery);
+                if (mounted) Navigator.pop(context, f);
+              },
+            ),
+          ],
+        ),
+      ),
+    );
+    if (picked == null) return;
+    final bytes = await picked.readAsBytes();
+    final mime = _guessMime(picked.name);
+    await _sendFileBytes(bytes, picked.name, mime);
+  }
+
+  void _pickAnyFile() async {
+    FilePickerResult? result = await FilePicker.platform.pickFiles(withData: true);
+    if (result == null || result.files.single.bytes == null) return;
+    final bytes = result.files.single.bytes!;
+    final fileName = result.files.single.name;
+    final mime = _guessMime(fileName);
+    await _sendFileBytes(bytes, fileName, mime);
+  }
+
+  void _showAttachOptions() {
+    showModalBottomSheet(
+      context: context,
+      builder: (context) => SafeArea(
+        child: Wrap(
+          children: [
+            ListTile(
+              leading: const Icon(Icons.image),
+              title: const Text('Photo / Video'),
+              onTap: () {
+                Navigator.pop(context);
+                _pickImageOrVideo();
+              },
+            ),
+            ListTile(
+              leading: const Icon(Icons.insert_drive_file),
+              title: const Text('Document / Any File'),
+              onTap: () {
+                Navigator.pop(context);
+                _pickAnyFile();
+              },
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Future<void> _saveToGallery(String localPath, String fileName) async {
+    try {
+      var result = await ImageGallerySaver.saveFile(localPath, name: fileName);
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text(result != null ? 'Saved to Gallery' : 'Failed to save')),
+        );
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Failed to save: $e')),
+        );
+      }
+    }
+  }
 
   void _sendMessage() {
     if (_msgController.text.trim().isEmpty) return;
@@ -1006,7 +1480,7 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
 
   void _setReply(Map item) {
     setState(() {
-      _replyToText = item['text'] ?? '';
+      _replyToText = item['type'] == 'text' ? (item['text'] ?? '') : '[${item['type'] ?? 'file'}]';
       _replyToSender =
           item['sender'] == currentUid ? 'You' : (item['senderPhone'] ?? 'Unknown');
     });
@@ -1072,10 +1546,10 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
     );
   }
 
-  @override
-  void dispose() {
-    _notifPlayer.dispose();
-    super.dispose();
+  void _listenForNewMessages() {
+    _dbRef.child('groups').child(widget.groupId).child('messages').onValue.listen((event) {
+      // handled via StreamBuilder in build(); this listener only tracks count for notification sound
+    });
   }
 
   Widget _buildReplyPreviewInBubble(Map item) {
@@ -1104,8 +1578,139 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
     );
   }
 
+  Widget _buildMessageContent(Map item) {
+    String type = item['type'] ?? 'text';
+    if (type == 'text') {
+      return Text(item['text'] ?? '');
+    }
+
+    String? localPath = _localFilePaths[item['fileId']];
+    String fileName = item['fileName'] ?? 'File';
+
+    if (type == 'image') {
+      if (localPath == null) {
+        return Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Icon(Icons.image, size: 20),
+            const SizedBox(width: 4),
+            Flexible(child: Text('$fileName (receiving...)', overflow: TextOverflow.ellipsis)),
+          ],
+        );
+      }
+      return Stack(
+        children: [
+          ClipRRect(
+            borderRadius: BorderRadius.circular(8),
+            child: Image.file(File(localPath), width: 180, fit: BoxFit.cover),
+          ),
+          Positioned(
+            right: 2,
+            bottom: 2,
+            child: GestureDetector(
+              onTap: () => _saveToGallery(localPath, fileName),
+              child: Container(
+                padding: const EdgeInsets.all(4),
+                decoration:
+                    BoxDecoration(color: Colors.black54, borderRadius: BorderRadius.circular(20)),
+                child: const Icon(Icons.download, color: Colors.white, size: 16),
+              ),
+            ),
+          ),
+        ],
+      );
+    }
+
+    if (type == 'video') {
+      if (localPath == null) {
+        return Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Icon(Icons.videocam, size: 20),
+            const SizedBox(width: 4),
+            Flexible(child: Text('$fileName (receiving...)', overflow: TextOverflow.ellipsis)),
+          ],
+        );
+      }
+      return GestureDetector(
+        onTap: () {
+          Navigator.push(
+            context,
+            MaterialPageRoute(builder: (_) => VideoPlayerPage(filePath: localPath)),
+          );
+        },
+        child: Stack(
+          alignment: Alignment.center,
+          children: [
+            Container(
+              width: 180,
+              height: 120,
+              decoration: BoxDecoration(color: Colors.black87, borderRadius: BorderRadius.circular(8)),
+              child: const Icon(Icons.play_circle_fill, color: Colors.white, size: 48),
+            ),
+            Positioned(
+              right: 6,
+              bottom: 6,
+              child: GestureDetector(
+                onTap: () => _saveToGallery(localPath, fileName),
+                child: Container(
+                  padding: const EdgeInsets.all(4),
+                  decoration:
+                      BoxDecoration(color: Colors.black54, borderRadius: BorderRadius.circular(20)),
+                  child: const Icon(Icons.download, color: Colors.white, size: 16),
+                ),
+              ),
+            ),
+          ],
+        ),
+      );
+    }
+
+    if (type == 'voice') {
+      if (localPath == null) {
+        return const Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(Icons.mic, size: 20),
+            SizedBox(width: 4),
+            Text('Voice message (receiving...)'),
+          ],
+        );
+      }
+      return VoiceMessageBubble(filePath: localPath);
+    }
+
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Icon(localPath != null ? Icons.insert_drive_file : Icons.hourglass_bottom, size: 20),
+        const SizedBox(width: 4),
+        Flexible(
+          child: Text(
+            localPath != null ? fileName : '$fileName (receiving...)',
+            overflow: TextOverflow.ellipsis,
+          ),
+        ),
+      ],
+    );
+  }
+
+  @override
+  void dispose() {
+    _presenceSub?.cancel();
+    _membersSub?.cancel();
+    _dbRef.child('groups').child(widget.groupId).child('presence').child(currentUid).remove();
+    for (var conn in _peerConns.values) {
+      conn.close();
+    }
+    _notifPlayer.dispose();
+    super.dispose();
+  }
+
   @override
   Widget build(BuildContext context) {
+    int onlinePeers = _channelReady.values.where((v) => v == true).length;
+
     return Scaffold(
       appBar: AppBar(
         title: StreamBuilder(
@@ -1124,8 +1729,7 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
             onPressed: () {
               Navigator.push(
                 context,
-                MaterialPageRoute(
-                    builder: (context) => GroupInfoScreen(groupId: widget.groupId)),
+                MaterialPageRoute(builder: (context) => GroupInfoScreen(groupId: widget.groupId)),
               );
             },
           ),
@@ -1137,10 +1741,12 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
             width: double.infinity,
             color: Colors.blue.shade50,
             padding: const EdgeInsets.symmetric(vertical: 4),
-            child: const Text(
-              'Group calls, photo, video and file sharing are not available yet',
+            child: Text(
+              onlinePeers > 0
+                  ? '$onlinePeers member(s) online for file sharing'
+                  : 'Only members who have this chat open can receive files',
               textAlign: TextAlign.center,
-              style: TextStyle(fontSize: 11),
+              style: const TextStyle(fontSize: 11),
             ),
           ),
           Expanded(
@@ -1151,8 +1757,8 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
                   Map<dynamic, dynamic> map =
                       snapshot.data!.snapshot.value as Map<dynamic, dynamic>;
                   List<MapEntry<dynamic, dynamic>> entries = map.entries.toList();
-                  entries.sort((a, b) => (a.value['timestamp'] ?? 0)
-                      .compareTo(b.value['timestamp'] ?? 0));
+                  entries.sort((a, b) =>
+                      (a.value['timestamp'] ?? 0).compareTo(b.value['timestamp'] ?? 0));
 
                   entries = entries.where((e) {
                     final deletedFor = e.value['deletedFor'] as Map<dynamic, dynamic>?;
@@ -1176,14 +1782,12 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
                       return GestureDetector(
                         onLongPress: () => _showMessageOptions(key, item),
                         child: Align(
-                          alignment:
-                              isMe ? Alignment.centerRight : Alignment.centerLeft,
+                          alignment: isMe ? Alignment.centerRight : Alignment.centerLeft,
                           child: Container(
-                            margin: const EdgeInsets.symmetric(
-                                horizontal: 8, vertical: 4),
+                            margin: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
                             padding: const EdgeInsets.all(10),
-                            constraints: BoxConstraints(
-                                maxWidth: MediaQuery.of(context).size.width * 0.75),
+                            constraints:
+                                BoxConstraints(maxWidth: MediaQuery.of(context).size.width * 0.75),
                             decoration: BoxDecoration(
                               color: isMe
                                   ? Theme.of(context).colorScheme.primaryContainer
@@ -1198,12 +1802,10 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
                                   Text(
                                     item['senderPhone'] ?? 'Unknown',
                                     style: const TextStyle(
-                                        fontSize: 11,
-                                        fontWeight: FontWeight.bold,
-                                        color: Colors.teal),
+                                        fontSize: 11, fontWeight: FontWeight.bold, color: Colors.teal),
                                   ),
                                 _buildReplyPreviewInBubble(item),
-                                Text(item['text'] ?? ''),
+                                _buildMessageContent(item),
                               ],
                             ),
                           ),
@@ -1231,9 +1833,7 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
                       children: [
                         Text('Replying to $_replyToSender',
                             style: const TextStyle(
-                                fontSize: 11,
-                                fontWeight: FontWeight.bold,
-                                color: Colors.teal)),
+                                fontSize: 11, fontWeight: FontWeight.bold, color: Colors.teal)),
                         Text(_replyToText ?? '',
                             maxLines: 1,
                             overflow: TextOverflow.ellipsis,
@@ -1250,8 +1850,11 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
             child: Row(
               children: [
                 IconButton(
-                  icon: Icon(
-                      _showEmojiPicker ? Icons.keyboard : Icons.emoji_emotions_outlined),
+                  icon: const Icon(Icons.attach_file),
+                  onPressed: _showAttachOptions,
+                ),
+                IconButton(
+                  icon: Icon(_showEmojiPicker ? Icons.keyboard : Icons.emoji_emotions_outlined),
                   onPressed: () {
                     setState(() => _showEmojiPicker = !_showEmojiPicker);
                     if (_showEmojiPicker) FocusScope.of(context).unfocus();
@@ -1359,8 +1962,7 @@ class _GroupInfoScreenState extends State<GroupInfoScreen> {
 
   Future<void> _addMembers(List<String> currentMemberUids) async {
     final contacts = await getMatchedAppUsers(currentUid);
-    final available =
-        contacts.where((c) => !currentMemberUids.contains(c['uid'])).toList();
+    final available = contacts.where((c) => !currentMemberUids.contains(c['uid'])).toList();
     if (available.isEmpty) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
@@ -1491,8 +2093,7 @@ class _GroupInfoScreenState extends State<GroupInfoScreen> {
               const SizedBox(height: 8),
               Center(
                 child: Text('Invite Code: ${group['inviteCode'] ?? ''}',
-                    style: const TextStyle(
-                        fontWeight: FontWeight.bold, color: Colors.teal)),
+                    style: const TextStyle(fontWeight: FontWeight.bold, color: Colors.teal)),
               ),
               const SizedBox(height: 4),
               Center(
@@ -1531,9 +2132,7 @@ class _GroupInfoScreenState extends State<GroupInfoScreen> {
                 return ListTile(
                   leading: const CircleAvatar(child: Icon(Icons.person)),
                   title: Text(isMe ? '$phone (You)' : phone),
-                  subtitle: isAdmin
-                      ? const Text('Admin', style: TextStyle(color: Colors.teal))
-                      : null,
+                  subtitle: isAdmin ? const Text('Admin', style: TextStyle(color: Colors.teal)) : null,
                   trailing: (amAdmin && !isMe)
                       ? PopupMenuButton<String>(
                           onSelected: (value) {
@@ -1642,8 +2241,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
                     ),
                   ),
                   const SizedBox(height: 8),
-                  const Text('Tap photo to change',
-                      style: TextStyle(fontSize: 12, color: Colors.grey)),
+                  const Text('Tap photo to change', style: TextStyle(fontSize: 12, color: Colors.grey)),
                   const SizedBox(height: 24),
                   Text(phone, style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
                 ],
@@ -1680,7 +2278,7 @@ class PrivacyPolicyScreen extends StatelessWidget {
               Text('• Messages: Text messages are stored securely to enable delivery between you and your contacts or groups.',
                   style: TextStyle(fontSize: 14)),
               SizedBox(height: 8),
-              Text('• Calls & Files: Audio calls, video calls, photos, videos, and files (in 1-on-1 chats) are sent directly (peer-to-peer) between devices and are not stored on any server.',
+              Text('• Calls & Files: Audio calls, video calls, photos, videos, and files are sent directly (peer-to-peer) between devices and are not stored on any server.',
                   style: TextStyle(fontSize: 14)),
               SizedBox(height: 8),
               Text('• Contacts: We access your phone contacts only to check which of your contacts also use this app. Your contacts are not uploaded or shared with anyone.',
@@ -1747,136 +2345,6 @@ class AboutScreen extends StatelessWidget {
           ],
         ),
       ),
-    );
-  }
-}
-
-// ---------------- Voice Message Bubble Widget ----------------
-class VoiceMessageBubble extends StatefulWidget {
-  final String filePath;
-  const VoiceMessageBubble({super.key, required this.filePath});
-
-  @override
-  State<VoiceMessageBubble> createState() => _VoiceMessageBubbleState();
-}
-
-class _VoiceMessageBubbleState extends State<VoiceMessageBubble> {
-  final AudioPlayer _player = AudioPlayer();
-  bool _isPlaying = false;
-  Duration _duration = Duration.zero;
-  Duration _position = Duration.zero;
-
-  @override
-  void initState() {
-    super.initState();
-    _player.onDurationChanged.listen((d) {
-      if (mounted) setState(() => _duration = d);
-    });
-    _player.onPositionChanged.listen((p) {
-      if (mounted) setState(() => _position = p);
-    });
-    _player.onPlayerComplete.listen((_) {
-      if (mounted) setState(() => _isPlaying = false);
-    });
-  }
-
-  void _togglePlay() async {
-    if (_isPlaying) {
-      await _player.pause();
-      setState(() => _isPlaying = false);
-    } else {
-      await _player.play(DeviceFileSource(widget.filePath));
-      setState(() => _isPlaying = true);
-    }
-  }
-
-  String _fmt(Duration d) {
-    String twoDigits(int n) => n.toString().padLeft(2, '0');
-    return '${twoDigits(d.inMinutes)}:${twoDigits(d.inSeconds % 60)}';
-  }
-
-  @override
-  void dispose() {
-    _player.dispose();
-    super.dispose();
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return Row(
-      mainAxisSize: MainAxisSize.min,
-      children: [
-        IconButton(
-          icon: Icon(_isPlaying ? Icons.pause_circle : Icons.play_circle,
-              size: 32, color: Colors.teal),
-          onPressed: _togglePlay,
-        ),
-        Text(
-          _duration.inMilliseconds > 0
-              ? '${_fmt(_position)} / ${_fmt(_duration)}'
-              : 'Voice message',
-          style: const TextStyle(fontSize: 12),
-        ),
-      ],
-    );
-  }
-}
-
-// ---------------- Inline Video Player Page ----------------
-class VideoPlayerPage extends StatefulWidget {
-  final String filePath;
-  const VideoPlayerPage({super.key, required this.filePath});
-
-  @override
-  State<VideoPlayerPage> createState() => _VideoPlayerPageState();
-}
-
-class _VideoPlayerPageState extends State<VideoPlayerPage> {
-  late VideoPlayerController _controller;
-  bool _initialized = false;
-
-  @override
-  void initState() {
-    super.initState();
-    _controller = VideoPlayerController.file(File(widget.filePath))
-      ..initialize().then((_) {
-        if (mounted) {
-          setState(() => _initialized = true);
-          _controller.play();
-        }
-      });
-  }
-
-  @override
-  void dispose() {
-    _controller.dispose();
-    super.dispose();
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return Scaffold(
-      backgroundColor: Colors.black,
-      appBar: AppBar(backgroundColor: Colors.black, foregroundColor: Colors.white),
-      body: Center(
-        child: _initialized
-            ? AspectRatio(
-                aspectRatio: _controller.value.aspectRatio,
-                child: VideoPlayer(_controller),
-              )
-            : const CircularProgressIndicator(),
-      ),
-      floatingActionButton: _initialized
-          ? FloatingActionButton(
-              onPressed: () {
-                setState(() {
-                  _controller.value.isPlaying ? _controller.pause() : _controller.play();
-                });
-              },
-              child:
-                  Icon(_controller.value.isPlaying ? Icons.pause : Icons.play_arrow),
-            )
-          : null,
     );
   }
 }
@@ -3051,7 +3519,6 @@ class _CallScreenState extends State<CallScreen> {
     return '$m:$s';
   }
 
-  // ---------------- Caller flow ----------------
   Future<void> _makeCall() async {
     try {
       _localStream = await _getUserMedia();
@@ -3107,7 +3574,6 @@ class _CallScreenState extends State<CallScreen> {
     }
   }
 
-  // ---------------- Callee flow ----------------
   Future<void> _acceptCall() async {
     try {
       setState(() => _callStatus = 'connecting');
@@ -3163,7 +3629,6 @@ class _CallScreenState extends State<CallScreen> {
 
   void _declineCall() {
     _dbRef.child('calls').child(widget.callId).child('status').set('declined');
-    // Give the caller a moment to see the status change before wiping the record
     Future.delayed(const Duration(seconds: 3), () {
       _dbRef.child('calls').child(widget.callId).remove();
     });
@@ -3184,7 +3649,6 @@ class _CallScreenState extends State<CallScreen> {
     });
   }
 
-  // ---------------- Controls ----------------
   void _toggleMute() {
     if (_localStream == null) return;
     setState(() => _isMuted = !_isMuted);
@@ -3304,10 +3768,8 @@ class _CallScreenState extends State<CallScreen> {
     }
   }
 
-  // ---------------- Cleanup ----------------
   void _endCall() {
     _dbRef.child('calls').child(widget.callId).child('status').set('ended');
-    // Give the peer a moment to see the status change before wiping the record
     Future.delayed(const Duration(seconds: 3), () {
       _dbRef.child('calls').child(widget.callId).remove();
     });
