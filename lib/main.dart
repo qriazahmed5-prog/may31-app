@@ -81,10 +81,9 @@ String generateInviteCode() {
   return List.generate(6, (_) => chars[rnd.nextInt(chars.length)]).join();
 }
 
-Future<List<Map<String, dynamic>>> getMatchedAppUsers(String currentUid) async {
+Future<Set<String>> getMyContactNumbers() async {
   bool granted = await FlutterContacts.requestPermission();
-  if (!granted) return [];
-
+  if (!granted) return {};
   List<Contact> contacts = await FlutterContacts.getContacts(withProperties: true);
   Set<String> contactNumbers = {};
   for (var c in contacts) {
@@ -92,6 +91,12 @@ Future<List<Map<String, dynamic>>> getMatchedAppUsers(String currentUid) async {
       contactNumbers.add(normalizePhone(p.number));
     }
   }
+  return contactNumbers;
+}
+
+Future<List<Map<String, dynamic>>> getMatchedAppUsers(String currentUid) async {
+  final contactNumbers = await getMyContactNumbers();
+  if (contactNumbers.isEmpty) return [];
 
   final dbRef = FirebaseDatabase.instance.ref();
   final snapshot = await dbRef.child('users').get();
@@ -482,7 +487,7 @@ class SettingsScreen extends StatelessWidget {
   }
 }
 
-// ---------------- Chats Tab ----------------
+// ---------------- Chats Tab (Real-time contacts refresh) ----------------
 class ChatsTabContent extends StatefulWidget {
   const ChatsTabContent({super.key});
 
@@ -493,32 +498,38 @@ class ChatsTabContent extends StatefulWidget {
 class _ChatsTabContentState extends State<ChatsTabContent> {
   final currentUid = FirebaseAuth.instance.currentUser?.uid ?? '';
   final dbRef = FirebaseDatabase.instance.ref();
-  bool _loading = true;
-  List<Map<String, dynamic>> _matchedUsers = [];
+  bool _loadingContacts = true;
+  Set<String> _myContactNumbers = {};
   Set<String> _hiddenChats = {};
+  StreamSubscription? _hiddenSub;
 
   @override
   void initState() {
     super.initState();
-    _load();
+    _loadContacts();
+    _listenHiddenChats();
   }
 
-  Future<void> _load() async {
-    setState(() => _loading = true);
-    final users = await getMatchedAppUsers(currentUid);
-    final hiddenSnap = await dbRef.child('users').child(currentUid).child('hiddenChats').get();
-    Set<String> hidden = {};
-    if (hiddenSnap.exists && hiddenSnap.value != null) {
-      Map<dynamic, dynamic> map = hiddenSnap.value as Map<dynamic, dynamic>;
-      hidden = map.keys.map((e) => e.toString()).toSet();
-    }
+  Future<void> _loadContacts() async {
+    setState(() => _loadingContacts = true);
+    final numbers = await getMyContactNumbers();
     if (mounted) {
       setState(() {
-        _matchedUsers = users;
-        _hiddenChats = hidden;
-        _loading = false;
+        _myContactNumbers = numbers;
+        _loadingContacts = false;
       });
     }
+  }
+
+  void _listenHiddenChats() {
+    _hiddenSub = dbRef.child('users').child(currentUid).child('hiddenChats').onValue.listen((event) {
+      Set<String> hidden = {};
+      if (event.snapshot.value != null) {
+        Map<dynamic, dynamic> map = event.snapshot.value as Map<dynamic, dynamic>;
+        hidden = map.keys.map((e) => e.toString()).toSet();
+      }
+      if (mounted) setState(() => _hiddenChats = hidden);
+    });
   }
 
   String _chatIdFor(String peerUid) {
@@ -530,84 +541,113 @@ class _ChatsTabContentState extends State<ChatsTabContent> {
   Future<void> _deleteChat(String peerUid) async {
     final chatId = _chatIdFor(peerUid);
     await dbRef.child('users').child(currentUid).child('hiddenChats').child(chatId).set(true);
-    setState(() {
-      _hiddenChats.add(chatId);
-    });
+  }
+
+  @override
+  void dispose() {
+    _hiddenSub?.cancel();
+    super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
-    if (_loading) return const Center(child: CircularProgressIndicator());
-    final visibleUsers = _matchedUsers
-        .where((u) => !_hiddenChats.contains(_chatIdFor(u['uid'])))
-        .toList();
-    return RefreshIndicator(
-      onRefresh: _load,
-      child: visibleUsers.isEmpty
-          ? ListView(
-              children: const [
-                Padding(
-                  padding: EdgeInsets.all(24.0),
-                  child: Text(
-                    'None of your phone contacts are using this app yet.\nPull down to refresh.',
-                    textAlign: TextAlign.center,
-                  ),
-                ),
-              ],
-            )
-          : ListView.builder(
-              itemCount: visibleUsers.length,
-              itemBuilder: (context, index) {
-                final user = visibleUsers[index];
-                return Dismissible(
-                  key: Key(user['uid']),
-                  direction: DismissDirection.endToStart,
-                  background: Container(
-                    color: Colors.red,
-                    alignment: Alignment.centerRight,
-                    padding: const EdgeInsets.symmetric(horizontal: 20),
-                    child: const Icon(Icons.delete, color: Colors.white),
-                  ),
-                  confirmDismiss: (direction) async {
-                    return await showDialog<bool>(
-                          context: context,
-                          builder: (context) => AlertDialog(
-                            title: const Text('Delete Chat?'),
-                            content: const Text(
-                                'This will remove the chat from your list. It will reappear if a new message arrives.'),
-                            actions: [
-                              TextButton(
-                                onPressed: () => Navigator.pop(context, false),
-                                child: const Text('Cancel'),
+    if (_loadingContacts) return const Center(child: CircularProgressIndicator());
+
+    // Real-time listen to all app users, filter against cached contact numbers.
+    // This means a newly-registered contact appears automatically without manual refresh.
+    return StreamBuilder(
+      stream: dbRef.child('users').onValue,
+      builder: (context, AsyncSnapshot<DatabaseEvent> snapshot) {
+        List<Map<String, dynamic>> matchedUsers = [];
+        if (snapshot.hasData && snapshot.data!.snapshot.value != null) {
+          Map<dynamic, dynamic> map = snapshot.data!.snapshot.value as Map<dynamic, dynamic>;
+          for (var entry in map.values) {
+            final user = entry as Map<dynamic, dynamic>;
+            if (user['uid'] == currentUid) continue;
+            final userPhone = user['phone'] ?? '';
+            if (_myContactNumbers.contains(normalizePhone(userPhone))) {
+              matchedUsers.add({
+                'uid': user['uid'],
+                'phone': user['phone'] ?? 'Unknown',
+                'photo': user['photo'],
+              });
+            }
+          }
+        }
+
+        final visibleUsers = matchedUsers
+            .where((u) => !_hiddenChats.contains(_chatIdFor(u['uid'])))
+            .toList();
+
+        return RefreshIndicator(
+          onRefresh: _loadContacts,
+          child: visibleUsers.isEmpty
+              ? ListView(
+                  children: const [
+                    Padding(
+                      padding: EdgeInsets.all(24.0),
+                      child: Text(
+                        'None of your phone contacts are using this app yet.\nThis list updates automatically when they join.',
+                        textAlign: TextAlign.center,
+                      ),
+                    ),
+                  ],
+                )
+              : ListView.builder(
+                  itemCount: visibleUsers.length,
+                  itemBuilder: (context, index) {
+                    final user = visibleUsers[index];
+                    return Dismissible(
+                      key: Key(user['uid']),
+                      direction: DismissDirection.endToStart,
+                      background: Container(
+                        color: Colors.red,
+                        alignment: Alignment.centerRight,
+                        padding: const EdgeInsets.symmetric(horizontal: 20),
+                        child: const Icon(Icons.delete, color: Colors.white),
+                      ),
+                      confirmDismiss: (direction) async {
+                        return await showDialog<bool>(
+                              context: context,
+                              builder: (context) => AlertDialog(
+                                title: const Text('Delete Chat?'),
+                                content: const Text(
+                                    'This will remove the chat from your list. It will reappear if a new message arrives.'),
+                                actions: [
+                                  TextButton(
+                                    onPressed: () => Navigator.pop(context, false),
+                                    child: const Text('Cancel'),
+                                  ),
+                                  TextButton(
+                                    onPressed: () => Navigator.pop(context, true),
+                                    child: const Text('Delete'),
+                                  ),
+                                ],
                               ),
-                              TextButton(
-                                onPressed: () => Navigator.pop(context, true),
-                                child: const Text('Delete'),
+                            ) ??
+                            false;
+                      },
+                      onDismissed: (direction) => _deleteChat(user['uid']),
+                      child: ListTile(
+                        leading: avatarWidget(user['photo']),
+                        title: Text(user['phone'] ?? 'Unknown'),
+                        onTap: () {
+                          Navigator.push(
+                            context,
+                            MaterialPageRoute(
+                              builder: (context) => ChatScreen(
+                                peerUid: user['uid'],
+                                peerName: user['phone'] ?? 'Unknown',
                               ),
-                            ],
-                          ),
-                        ) ??
-                        false;
+                            ),
+                          );
+                        },
+                      ),
+                    );
                   },
-                  onDismissed: (direction) => _deleteChat(user['uid']),
-                  child: ListTile(
-                    leading: avatarWidget(user['photo']),
-                    title: Text(user['phone'] ?? 'Unknown'),
-                    onTap: () {
-                      Navigator.push(
-                        context,
-                        MaterialPageRoute(
-                          builder: (context) => ChatScreen(
-                            peerUid: user['uid'],
-                            peerName: user['phone'] ?? 'Unknown',
-                          ),
-                        ),
-                      ).then((_) => _load());
-                    },
-                  ),
-                );
-              },
-            ),
+                ),
+        );
+      },
     );
   }
 }
@@ -1110,12 +1150,10 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
   String? _replyToText;
   String? _replyToSender;
 
-  // ---- P2P mesh for media sharing ----
   final Map<String, RTCPeerConnection> _peerConns = {};
   final Map<String, RTCDataChannel> _dataChannels = {};
   final Map<String, bool> _channelReady = {};
   StreamSubscription? _presenceSub;
-  StreamSubscription? _membersSub;
   Set<String> _presentMembers = {};
   List<String> _allMemberUids = [];
 
@@ -1130,19 +1168,16 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
   }
 
   void _setupPresenceAndMesh() async {
-    // Mark self as present in this group chat
     final presenceRef = _dbRef.child('groups').child(widget.groupId).child('presence').child(currentUid);
     await presenceRef.set(true);
     presenceRef.onDisconnect().remove();
 
-    // Load member list once
     final groupSnap = await _dbRef.child('groups').child(widget.groupId).child('members').get();
     if (groupSnap.exists && groupSnap.value != null) {
       Map<dynamic, dynamic> map = groupSnap.value as Map<dynamic, dynamic>;
       _allMemberUids = map.keys.map((e) => e.toString()).where((u) => u != currentUid).toList();
     }
 
-    // Listen for who else is currently present -> establish P2P connection with them
     _presenceSub = _dbRef
         .child('groups')
         .child(widget.groupId)
@@ -1160,8 +1195,6 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
       }
       _presentMembers = present;
     });
-
-    _listenForNewMessages();
   }
 
   void _connectToPeer(String peerUid) async {
@@ -1546,12 +1579,6 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
     );
   }
 
-  void _listenForNewMessages() {
-    _dbRef.child('groups').child(widget.groupId).child('messages').onValue.listen((event) {
-      // handled via StreamBuilder in build(); this listener only tracks count for notification sound
-    });
-  }
-
   Widget _buildReplyPreviewInBubble(Map item) {
     if (item['replyToText'] == null) return const SizedBox.shrink();
     return Container(
@@ -1698,7 +1725,6 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
   @override
   void dispose() {
     _presenceSub?.cancel();
-    _membersSub?.cancel();
     _dbRef.child('groups').child(widget.groupId).child('presence').child(currentUid).remove();
     for (var conn in _peerConns.values) {
       conn.close();
@@ -2349,7 +2375,7 @@ class AboutScreen extends StatelessWidget {
   }
 }
 
-// ---------------- Private Chat Screen (1-on-1) ----------------
+// ---------------- Private Chat Screen (1-on-1, with message search) ----------------
 class ChatScreen extends StatefulWidget {
   final String peerUid;
   final String peerName;
@@ -2363,6 +2389,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   final String currentUid = FirebaseAuth.instance.currentUser?.uid ?? '';
   final DatabaseReference _dbRef = FirebaseDatabase.instance.ref();
   final TextEditingController _msgController = TextEditingController();
+  final TextEditingController _searchController = TextEditingController();
   final AudioPlayer _notifPlayer = AudioPlayer();
   late String chatId;
   int _lastMessageCount = 0;
@@ -2371,6 +2398,8 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   bool _peerTyping = false;
   bool _iBlockedPeer = false;
   bool _checkedBlockStatus = false;
+  bool _showSearch = false;
+  String _searchQuery = '';
 
   String? _replyToId;
   String? _replyToText;
@@ -3128,6 +3157,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     _fileChannel?.close();
     _fileConn?.close();
     _audioRecorder.dispose();
+    _searchController.dispose();
     super.dispose();
   }
 
@@ -3135,37 +3165,63 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Text(widget.peerName),
-            if (_peerTyping)
-              const Text('typing...',
-                  style: TextStyle(fontSize: 12, color: Colors.white70)),
-          ],
-        ),
+        title: _showSearch
+            ? TextField(
+                controller: _searchController,
+                autofocus: true,
+                style: const TextStyle(color: Colors.white),
+                decoration: const InputDecoration(
+                  hintText: 'Search messages...',
+                  hintStyle: TextStyle(color: Colors.white70),
+                  border: InputBorder.none,
+                ),
+                onChanged: (val) => setState(() => _searchQuery = val.toLowerCase()),
+              )
+            : Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Text(widget.peerName),
+                  if (_peerTyping)
+                    const Text('typing...',
+                        style: TextStyle(fontSize: 12, color: Colors.white70)),
+                ],
+              ),
         actions: [
           IconButton(
-            icon: const Icon(Icons.call),
-            onPressed: () => _startCall(false),
+            icon: Icon(_showSearch ? Icons.close : Icons.search),
+            onPressed: () {
+              setState(() {
+                _showSearch = !_showSearch;
+                if (!_showSearch) {
+                  _searchController.clear();
+                  _searchQuery = '';
+                }
+              });
+            },
           ),
-          IconButton(
-            icon: const Icon(Icons.videocam),
-            onPressed: () => _startCall(true),
-          ),
-          if (_checkedBlockStatus)
-            PopupMenuButton<String>(
-              onSelected: (value) {
-                if (value == 'block') _toggleBlock();
-              },
-              itemBuilder: (context) => [
-                PopupMenuItem(
-                  value: 'block',
-                  child: Text(_iBlockedPeer ? 'Unblock' : 'Block'),
-                ),
-              ],
+          if (!_showSearch) ...[
+            IconButton(
+              icon: const Icon(Icons.call),
+              onPressed: () => _startCall(false),
             ),
+            IconButton(
+              icon: const Icon(Icons.videocam),
+              onPressed: () => _startCall(true),
+            ),
+            if (_checkedBlockStatus)
+              PopupMenuButton<String>(
+                onSelected: (value) {
+                  if (value == 'block') _toggleBlock();
+                },
+                itemBuilder: (context) => [
+                  PopupMenuItem(
+                    value: 'block',
+                    child: Text(_iBlockedPeer ? 'Unblock' : 'Block'),
+                  ),
+                ],
+              ),
+          ],
         ],
       ),
       body: Column(
@@ -3199,23 +3255,31 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                 if (snapshot.hasData && snapshot.data!.snapshot.value != null) {
                   Map<dynamic, dynamic> map =
                       snapshot.data!.snapshot.value as Map<dynamic, dynamic>;
-                  List<MapEntry<dynamic, dynamic>> entries = map.entries.toList();
-                  entries.sort((a, b) => (a.value['timestamp'] ?? 0)
-                      .compareTo(b.value['timestamp'] ?? 0));
+                  List<dynamic> list = map.values.toList();
+                  list.sort((a, b) =>
+                      (a['timestamp'] ?? 0).compareTo(b['timestamp'] ?? 0));
 
-                  entries = entries.where((e) {
-                    final deletedFor = e.value['deletedFor'] as Map<dynamic, dynamic>?;
-                    return deletedFor == null || deletedFor[currentUid] != true;
-                  }).toList();
+                  if (_searchQuery.isNotEmpty) {
+                    list = list.where((item) {
+                      final type = item['type'] ?? 'text';
+                      if (type == 'text') {
+                        return (item['text'] ?? '').toString().toLowerCase().contains(_searchQuery);
+                      }
+                      return (item['fileName'] ?? '').toString().toLowerCase().contains(_searchQuery);
+                    }).toList();
+                  }
+
+                  if (list.isEmpty && _searchQuery.isNotEmpty) {
+                    return const Center(child: Text('No messages match your search'));
+                  }
 
                   return ListView.builder(
-                    itemCount: entries.length,
+                    itemCount: list.length,
                     itemBuilder: (context, index) {
-                      var key = entries[index].key.toString();
-                      var item = entries[index].value;
+                      var item = list[index];
                       bool isMe = item['sender'] == currentUid;
                       return GestureDetector(
-                        onLongPress: () => _showMessageOptions(key, item),
+                        onLongPress: () => _setReply(item),
                         child: Align(
                           alignment:
                               isMe ? Alignment.centerRight : Alignment.centerLeft,
