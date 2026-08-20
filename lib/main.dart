@@ -553,8 +553,6 @@ class _ChatsTabContentState extends State<ChatsTabContent> {
   Widget build(BuildContext context) {
     if (_loadingContacts) return const Center(child: CircularProgressIndicator());
 
-    // Real-time listen to all app users, filter against cached contact numbers.
-    // This means a newly-registered contact appears automatically without manual refresh.
     return StreamBuilder(
       stream: dbRef.child('users').onValue,
       builder: (context, AsyncSnapshot<DatabaseEvent> snapshot) {
@@ -1130,7 +1128,7 @@ class _VideoPlayerPageState extends State<VideoPlayerPage> {
   }
 }
 
-// ---------------- Group Chat Screen (with P2P mesh media sharing) ----------------
+// ---------------- Group Chat Screen (with P2P mesh media sharing + group call) ----------------
 class GroupChatScreen extends StatefulWidget {
   final String groupId;
   const GroupChatScreen({super.key, required this.groupId});
@@ -1722,6 +1720,39 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
     );
   }
 
+  // -------- Group Call --------
+  Future<void> _startOrJoinGroupCall(bool isVideo) async {
+    final activeSnap = await _dbRef.child('groups').child(widget.groupId).child('activeCall').get();
+    String callId;
+    bool actualIsVideo = isVideo;
+
+    if (activeSnap.exists && activeSnap.value != null) {
+      Map<dynamic, dynamic> active = activeSnap.value as Map<dynamic, dynamic>;
+      callId = active['callId'];
+      actualIsVideo = active['isVideo'] ?? isVideo;
+    } else {
+      callId = _dbRef.child('groups').child(widget.groupId).child('groupCallParticipants').push().key!;
+      await _dbRef.child('groups').child(widget.groupId).child('activeCall').set({
+        'callId': callId,
+        'isVideo': isVideo,
+        'startedBy': currentUid,
+        'startedAt': DateTime.now().millisecondsSinceEpoch,
+      });
+    }
+
+    if (!mounted) return;
+    Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (context) => GroupCallScreen(
+          groupId: widget.groupId,
+          callId: callId,
+          isVideo: actualIsVideo,
+        ),
+      ),
+    );
+  }
+
   @override
   void dispose() {
     _presenceSub?.cancel();
@@ -1751,6 +1782,14 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
         ),
         actions: [
           IconButton(
+            icon: const Icon(Icons.call),
+            onPressed: () => _startOrJoinGroupCall(false),
+          ),
+          IconButton(
+            icon: const Icon(Icons.videocam),
+            onPressed: () => _startOrJoinGroupCall(true),
+          ),
+          IconButton(
             icon: const Icon(Icons.info_outline),
             onPressed: () {
               Navigator.push(
@@ -1763,6 +1802,34 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
       ),
       body: Column(
         children: [
+          StreamBuilder(
+            stream: _dbRef.child('groups').child(widget.groupId).child('activeCall').onValue,
+            builder: (context, AsyncSnapshot<DatabaseEvent> snapshot) {
+              if (snapshot.hasData && snapshot.data!.snapshot.value != null) {
+                final active = snapshot.data!.snapshot.value as Map<dynamic, dynamic>;
+                bool isVideo = active['isVideo'] ?? false;
+                return Container(
+                  width: double.infinity,
+                  color: Colors.green.shade100,
+                  padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                  child: Row(
+                    children: [
+                      Icon(isVideo ? Icons.videocam : Icons.call, color: Colors.green.shade900),
+                      const SizedBox(width: 8),
+                      const Expanded(
+                        child: Text('Group call in progress', style: TextStyle(fontSize: 12)),
+                      ),
+                      ElevatedButton(
+                        onPressed: () => _startOrJoinGroupCall(isVideo),
+                        child: const Text('Join'),
+                      ),
+                    ],
+                  ),
+                );
+              }
+              return const SizedBox.shrink();
+            },
+          ),
           Container(
             width: double.infinity,
             color: Colors.blue.shade50,
@@ -1912,6 +1979,457 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
               ),
             ),
         ],
+      ),
+    );
+  }
+}
+
+// ---------------- Group Call Screen (Mesh, multiple participants) ----------------
+class GroupCallScreen extends StatefulWidget {
+  final String groupId;
+  final String callId;
+  final bool isVideo;
+
+  const GroupCallScreen({
+    super.key,
+    required this.groupId,
+    required this.callId,
+    required this.isVideo,
+  });
+
+  @override
+  State<GroupCallScreen> createState() => _GroupCallScreenState();
+}
+
+class _GroupCallScreenState extends State<GroupCallScreen> {
+  final String currentUid = FirebaseAuth.instance.currentUser?.uid ?? '';
+  final DatabaseReference _dbRef = FirebaseDatabase.instance.ref();
+
+  MediaStream? _localStream;
+  final RTCVideoRenderer _localRenderer = RTCVideoRenderer();
+  bool _localReady = false;
+
+  final Map<String, RTCPeerConnection> _peerConns = {};
+  final Map<String, MediaStream> _remoteStreams = {};
+  final Map<String, RTCVideoRenderer> _remoteRenderers = {};
+  final Map<String, String> _peerPhones = {};
+
+  StreamSubscription? _participantsSub;
+  Set<String> _participants = {};
+
+  bool _isMuted = false;
+  bool _isCameraOff = false;
+  bool _isFrontCamera = true;
+  bool _isSpeakerOn = true;
+  bool _leaving = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _init();
+  }
+
+  Future<void> _init() async {
+    await _localRenderer.initialize();
+
+    _localStream = await navigator.mediaDevices.getUserMedia({
+      'audio': true,
+      'video': widget.isVideo
+          ? {'facingMode': 'user', 'width': {'ideal': 480}, 'height': {'ideal': 360}}
+          : false,
+    });
+    _localRenderer.srcObject = _localStream;
+
+    if (mounted) setState(() => _localReady = true);
+
+    final participantsRef = _dbRef
+        .child('groups')
+        .child(widget.groupId)
+        .child('groupCallParticipants')
+        .child(widget.callId)
+        .child(currentUid);
+    await participantsRef.set(true);
+    participantsRef.onDisconnect().remove();
+
+    _participantsSub = _dbRef
+        .child('groups')
+        .child(widget.groupId)
+        .child('groupCallParticipants')
+        .child(widget.callId)
+        .onValue
+        .listen((event) {
+      if (event.snapshot.value == null) {
+        setState(() => _participants = {});
+        return;
+      }
+      Map<dynamic, dynamic> map = event.snapshot.value as Map<dynamic, dynamic>;
+      Set<String> present = map.keys.map((e) => e.toString()).where((u) => u != currentUid).toSet();
+
+      for (var uid in present) {
+        if (!_peerConns.containsKey(uid)) {
+          _connectToParticipant(uid);
+        }
+      }
+      for (var uid in _peerConns.keys.toList()) {
+        if (!present.contains(uid)) {
+          _disconnectFromParticipant(uid);
+        }
+      }
+      if (mounted) setState(() => _participants = present);
+    });
+  }
+
+  void _connectToParticipant(String peerUid) async {
+    final conn = await createPeerConnection({
+      'iceServers': [
+        {'urls': 'stun:stun.l.google.com:19302'},
+        {'urls': 'stun:stun1.l.google.com:19302'},
+      ]
+    });
+    _peerConns[peerUid] = conn;
+
+    if (_localStream != null) {
+      for (var track in _localStream!.getTracks()) {
+        await conn.addTrack(track, _localStream!);
+      }
+    }
+
+    conn.onTrack = (RTCTrackEvent event) async {
+      if (event.streams.isNotEmpty) {
+        final renderer = RTCVideoRenderer();
+        await renderer.initialize();
+        renderer.srcObject = event.streams[0];
+        if (mounted) {
+          setState(() {
+            _remoteStreams[peerUid] = event.streams[0];
+            _remoteRenderers[peerUid] = renderer;
+          });
+        }
+      }
+    };
+
+    List<String> pairIds = [currentUid, peerUid];
+    pairIds.sort();
+    String pairKey = '${pairIds[0]}_${pairIds[1]}';
+    final signalRef = _dbRef
+        .child('groups')
+        .child(widget.groupId)
+        .child('groupCallSignal')
+        .child(widget.callId)
+        .child(pairKey);
+
+    bool isInitiator = currentUid.compareTo(peerUid) < 0;
+
+    conn.onIceCandidate = (RTCIceCandidate candidate) {
+      if (candidate.candidate == null) return;
+      final path = isInitiator ? 'callerCandidates' : 'calleeCandidates';
+      signalRef.child(path).push().set(candidate.toMap());
+    };
+
+    if (isInitiator) {
+      await signalRef.remove();
+
+      RTCSessionDescription offer = await conn.createOffer({
+        'offerToReceiveAudio': true,
+        'offerToReceiveVideo': widget.isVideo,
+      });
+      await conn.setLocalDescription(offer);
+      await signalRef.child('offer').set({'sdp': offer.sdp, 'type': offer.type});
+
+      signalRef.child('answer').onValue.listen((event) async {
+        final data = event.snapshot.value as Map<dynamic, dynamic>?;
+        if (data != null && await conn.getRemoteDescription() == null) {
+          await conn.setRemoteDescription(RTCSessionDescription(data['sdp'], data['type']));
+        }
+      });
+
+      signalRef.child('calleeCandidates').onChildAdded.listen((event) {
+        final data = event.snapshot.value as Map<dynamic, dynamic>?;
+        if (data != null) {
+          conn.addCandidate(RTCIceCandidate(data['candidate'], data['sdpMid'], data['sdpMLineIndex']));
+        }
+      });
+    } else {
+      signalRef.child('offer').onValue.listen((event) async {
+        final data = event.snapshot.value as Map<dynamic, dynamic>?;
+        if (data != null && await conn.getRemoteDescription() == null) {
+          await conn.setRemoteDescription(RTCSessionDescription(data['sdp'], data['type']));
+          RTCSessionDescription answer = await conn.createAnswer({
+            'offerToReceiveAudio': true,
+            'offerToReceiveVideo': widget.isVideo,
+          });
+          await conn.setLocalDescription(answer);
+          await signalRef.child('answer').set({'sdp': answer.sdp, 'type': answer.type});
+        }
+      });
+
+      signalRef.child('callerCandidates').onChildAdded.listen((event) {
+        final data = event.snapshot.value as Map<dynamic, dynamic>?;
+        if (data != null) {
+          conn.addCandidate(RTCIceCandidate(data['candidate'], data['sdpMid'], data['sdpMLineIndex']));
+        }
+      });
+    }
+  }
+
+  void _disconnectFromParticipant(String peerUid) {
+    _peerConns[peerUid]?.close();
+    _peerConns.remove(peerUid);
+    _remoteRenderers[peerUid]?.dispose();
+    _remoteRenderers.remove(peerUid);
+    _remoteStreams.remove(peerUid);
+    if (mounted) setState(() {});
+  }
+
+  void _toggleMute() {
+    if (_localStream == null) return;
+    setState(() => _isMuted = !_isMuted);
+    for (var track in _localStream!.getAudioTracks()) {
+      track.enabled = !_isMuted;
+    }
+  }
+
+  void _toggleCamera() {
+    if (_localStream == null || !widget.isVideo) return;
+    setState(() => _isCameraOff = !_isCameraOff);
+    for (var track in _localStream!.getVideoTracks()) {
+      track.enabled = !_isCameraOff;
+    }
+  }
+
+  Future<void> _switchCamera() async {
+    if (_localStream == null || !widget.isVideo) return;
+    final videoTracks = _localStream!.getVideoTracks();
+    if (videoTracks.isEmpty) return;
+    await Helper.switchCamera(videoTracks.first);
+    setState(() => _isFrontCamera = !_isFrontCamera);
+  }
+
+  Future<void> _toggleSpeaker() async {
+    setState(() => _isSpeakerOn = !_isSpeakerOn);
+    await Helper.setSpeakerphoneOn(_isSpeakerOn);
+  }
+
+  Future<void> _leaveCall() async {
+    if (_leaving) return;
+    _leaving = true;
+
+    await _dbRef
+        .child('groups')
+        .child(widget.groupId)
+        .child('groupCallParticipants')
+        .child(widget.callId)
+        .child(currentUid)
+        .remove();
+
+    // If nobody else is left, clear active call + signaling data
+    final remainingSnap = await _dbRef
+        .child('groups')
+        .child(widget.groupId)
+        .child('groupCallParticipants')
+        .child(widget.callId)
+        .get();
+    if (!remainingSnap.exists || remainingSnap.value == null) {
+      await _dbRef.child('groups').child(widget.groupId).child('activeCall').remove();
+      await _dbRef
+          .child('groups')
+          .child(widget.groupId)
+          .child('groupCallSignal')
+          .child(widget.callId)
+          .remove();
+    }
+
+    for (var conn in _peerConns.values) {
+      conn.close();
+    }
+    for (var r in _remoteRenderers.values) {
+      r.dispose();
+    }
+    _localStream?.getTracks().forEach((t) => t.stop());
+    _localStream?.dispose();
+
+    if (mounted && Navigator.canPop(context)) {
+      Navigator.pop(context);
+    }
+  }
+
+  @override
+  void dispose() {
+    _participantsSub?.cancel();
+    if (!_leaving) {
+      _dbRef
+          .child('groups')
+          .child(widget.groupId)
+          .child('groupCallParticipants')
+          .child(widget.callId)
+          .child(currentUid)
+          .remove();
+    }
+    for (var conn in _peerConns.values) {
+      conn.close();
+    }
+    for (var r in _remoteRenderers.values) {
+      r.dispose();
+    }
+    _localRenderer.dispose();
+    _localStream?.getTracks().forEach((t) => t.stop());
+    _localStream?.dispose();
+    super.dispose();
+  }
+
+  Widget _buildTile({required Widget child, required String label}) {
+    return Container(
+      decoration: BoxDecoration(
+        color: Colors.grey.shade900,
+        borderRadius: BorderRadius.circular(8),
+      ),
+      clipBehavior: Clip.hardEdge,
+      child: Stack(
+        fit: StackFit.expand,
+        children: [
+          child,
+          Positioned(
+            bottom: 4,
+            left: 4,
+            child: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+              decoration: BoxDecoration(
+                color: Colors.black54,
+                borderRadius: BorderRadius.circular(4),
+              ),
+              child: Text(label, style: const TextStyle(color: Colors.white, fontSize: 10)),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    List<Widget> tiles = [];
+
+    if (widget.isVideo && _localReady && !_isCameraOff) {
+      tiles.add(_buildTile(
+        child: RTCVideoView(_localRenderer, mirror: _isFrontCamera),
+        label: 'You',
+      ));
+    } else {
+      tiles.add(_buildTile(
+        child: Container(
+          color: Colors.grey.shade800,
+          child: const Center(child: CircleAvatar(radius: 30, child: Icon(Icons.person))),
+        ),
+        label: 'You',
+      ));
+    }
+
+    for (var uid in _participants) {
+      final renderer = _remoteRenderers[uid];
+      if (widget.isVideo && renderer != null) {
+        tiles.add(_buildTile(
+          child: RTCVideoView(renderer),
+          label: _peerPhones[uid] ?? 'Member',
+        ));
+      } else {
+        tiles.add(_buildTile(
+          child: Container(
+            color: Colors.grey.shade800,
+            child: const Center(child: CircleAvatar(radius: 30, child: Icon(Icons.person))),
+          ),
+          label: _peerPhones[uid] ?? 'Member',
+        ));
+      }
+    }
+
+    return WillPopScope(
+      onWillPop: () async {
+        await _leaveCall();
+        return false;
+      },
+      child: Scaffold(
+        backgroundColor: Colors.black,
+        body: SafeArea(
+          child: !_localReady
+              ? const Center(child: CircularProgressIndicator())
+              : Column(
+                  children: [
+                    Padding(
+                      padding: const EdgeInsets.all(8.0),
+                      child: Text(
+                        '${_participants.length + 1} in call',
+                        style: const TextStyle(color: Colors.white70, fontSize: 12),
+                      ),
+                    ),
+                    Expanded(
+                      child: Padding(
+                        padding: const EdgeInsets.all(8.0),
+                        child: GridView.builder(
+                          gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
+                            crossAxisCount: tiles.length <= 2 ? 1 : 2,
+                            childAspectRatio: tiles.length <= 2 ? 1.3 : 0.9,
+                            crossAxisSpacing: 8,
+                            mainAxisSpacing: 8,
+                          ),
+                          itemCount: tiles.length,
+                          itemBuilder: (context, index) => tiles[index],
+                        ),
+                      ),
+                    ),
+                    Padding(
+                      padding: const EdgeInsets.symmetric(vertical: 20),
+                      child: Row(
+                        mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+                        children: [
+                          CircleAvatar(
+                            radius: 26,
+                            backgroundColor: _isMuted ? Colors.white : Colors.white24,
+                            child: IconButton(
+                              icon: Icon(_isMuted ? Icons.mic_off : Icons.mic,
+                                  color: _isMuted ? Colors.black : Colors.white),
+                              onPressed: _toggleMute,
+                            ),
+                          ),
+                          if (widget.isVideo)
+                            CircleAvatar(
+                              radius: 26,
+                              backgroundColor: _isCameraOff ? Colors.white : Colors.white24,
+                              child: IconButton(
+                                icon: Icon(_isCameraOff ? Icons.videocam_off : Icons.videocam,
+                                    color: _isCameraOff ? Colors.black : Colors.white),
+                                onPressed: _toggleCamera,
+                              ),
+                            ),
+                          if (widget.isVideo)
+                            CircleAvatar(
+                              radius: 26,
+                              backgroundColor: Colors.white24,
+                              child: IconButton(
+                                icon: const Icon(Icons.cameraswitch, color: Colors.white),
+                                onPressed: _switchCamera,
+                              ),
+                            ),
+                          CircleAvatar(
+                            radius: 26,
+                            backgroundColor: _isSpeakerOn ? Colors.white : Colors.white24,
+                            child: IconButton(
+                              icon: Icon(_isSpeakerOn ? Icons.volume_up : Icons.hearing,
+                                  color: _isSpeakerOn ? Colors.black : Colors.white),
+                              onPressed: _toggleSpeaker,
+                            ),
+                          ),
+                          FloatingActionButton(
+                            heroTag: 'leaveGroupCall',
+                            backgroundColor: Colors.red,
+                            onPressed: _leaveCall,
+                            child: const Icon(Icons.call_end),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ],
+                ),
+        ),
       ),
     );
   }
@@ -3444,7 +3962,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   }
 }
 
-// ---------------- Call Screen (Audio + Video) ----------------
+// ---------------- Call Screen (Audio + Video, 1-on-1) ----------------
 class CallScreen extends StatefulWidget {
   final String callId;
   final String peerUid;
