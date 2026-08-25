@@ -126,6 +126,28 @@ Future<bool> isUserBlocked(String myUid, String otherUid) async {
   return snap.exists && snap.value == true;
 }
 
+// FIX: shared backpressure helper for WebRTC data-channel file transfer.
+// entry.value.send() returns immediately and does not wait for the data to
+// actually leave the device, so a tight loop can queue chunks faster than
+// the channel drains them. On some platforms this silently drops data or
+// forces the channel to close once its internal buffer overflows. Before
+// every chunk we now poll `bufferedAmount` and pause briefly whenever it
+// grows past a safe high-water mark, resuming once it drains below the
+// low-water mark.
+const int kMaxBufferedAmount = 256 * 1024; // pause sending above this (bytes)
+const int kBufferedAmountLowMark = 64 * 1024; // resume once below this
+
+Future<void> waitForChannelDrain(RTCDataChannel channel) async {
+  int safetyCounter = 0;
+  // safetyCounter caps total wait so a stuck/closed channel can't hang the
+  // sender forever; the outer send-loop will simply skip ahead.
+  while ((channel.bufferedAmount ?? 0) > kMaxBufferedAmount && safetyCounter < 1000) {
+    if (channel.state != RTCDataChannelState.RTCDataChannelOpen) return;
+    await Future.delayed(const Duration(milliseconds: 15));
+    safetyCounter++;
+  }
+}
+
 Widget avatarWidget(String? photoBase64, {double radius = 20, IconData fallback = Icons.person}) {
   if (photoBase64 != null && photoBase64.isNotEmpty) {
     try {
@@ -255,60 +277,76 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
   final AudioPlayer _ringPlayer = AudioPlayer();
   bool _isRinging = false;
   late TabController _tabController;
+  StreamSubscription? _incomingCallsSub;
+
+  // Only treat calls started within this window (from when this screen mounted) as "incoming".
+  // Prevents stale/ghost "ringing" call documents (e.g. left over after a crash) from
+  // popping up a call screen the moment the app opens.
+  late final int _screenMountedAtMs;
 
   @override
   void initState() {
     super.initState();
+    _screenMountedAtMs = DateTime.now().millisecondsSinceEpoch;
     _tabController = TabController(length: 2, vsync: this);
     _listenForIncomingCalls();
   }
 
   void _listenForIncomingCalls() {
-    dbRef.child('calls').onChildAdded.listen((event) async {
+    _incomingCallsSub = dbRef.child('calls').onChildAdded.listen((event) async {
       final data = event.snapshot.value as Map<dynamic, dynamic>?;
       if (data == null) return;
-      if (data['calleeId'] == currentUid && data['status'] == 'ringing') {
-        final callerId = data['callerId'];
-        final blocked = await isUserBlocked(currentUid, callerId);
-        if (blocked) return;
+      if (data['calleeId'] != currentUid || data['status'] != 'ringing') return;
 
-        final callId = event.snapshot.key!;
+      // Ignore stale call docs (created before this screen was mounted, or with no/old timestamp).
+      final int callTimestamp = (data['timestamp'] is int)
+          ? data['timestamp'] as int
+          : 0;
+      const staleThresholdMs = 30000; // 30 seconds
+      final bool isStale = callTimestamp == 0 ||
+          callTimestamp < _screenMountedAtMs - staleThresholdMs;
+      if (isStale) return;
 
-        _isRinging = true;
-        await _ringPlayer.setReleaseMode(ReleaseMode.loop);
-        await _ringPlayer.play(AssetSource('sounds/nokia.mp3'));
+      final callerId = data['callerId'];
+      final blocked = await isUserBlocked(currentUid, callerId);
+      if (blocked) return;
 
-        StreamSubscription? statusSub;
-        statusSub = dbRef
-            .child('calls')
-            .child(callId)
-            .child('status')
-            .onValue
-            .listen((e) {
-          if (e.snapshot.value != 'ringing') {
-            _stopRingtone();
-            statusSub?.cancel();
-          }
-        });
+      final callId = event.snapshot.key!;
 
-        if (mounted) {
-          Navigator.push(
-            context,
-            MaterialPageRoute(
-              builder: (context) => CallScreen(
-                callId: callId,
-                peerUid: data['callerId'],
-                isVideo: data['isVideo'] ?? false,
-                isCaller: false,
-              ),
-            ),
-          ).then((_) {
-            _stopRingtone();
-            statusSub?.cancel();
-          });
-        } else {
-          statusSub.cancel();
+      _isRinging = true;
+      await _ringPlayer.setReleaseMode(ReleaseMode.loop);
+      await _ringPlayer.play(AssetSource('sounds/nokia.mp3'));
+
+      StreamSubscription? statusSub;
+      statusSub = dbRef
+          .child('calls')
+          .child(callId)
+          .child('status')
+          .onValue
+          .listen((e) {
+        if (e.snapshot.value != 'ringing') {
+          _stopRingtone();
+          statusSub?.cancel();
         }
+      });
+
+      if (mounted) {
+        Navigator.push(
+          context,
+          MaterialPageRoute(
+            builder: (context) => CallScreen(
+              callId: callId,
+              peerUid: data['callerId'],
+              isVideo: data['isVideo'] ?? false,
+              isCaller: false,
+            ),
+          ),
+        ).then((_) {
+          _stopRingtone();
+          statusSub?.cancel();
+        });
+      } else {
+        statusSub.cancel();
       }
     });
   }
@@ -322,6 +360,7 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
 
   @override
   void dispose() {
+    _incomingCallsSub?.cancel();
     _ringPlayer.dispose();
     _tabController.dispose();
     super.dispose();
@@ -1155,6 +1194,11 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
   Set<String> _presentMembers = {};
   List<String> _allMemberUids = [];
 
+  // FIX: track every signaling-related subscription per peer so we can cancel
+  // them on dispose / when a peer disconnects. Previously these leaked and kept
+  // firing after the connection was closed, throwing on a disposed PeerConnection.
+  final Map<String, List<StreamSubscription>> _peerSignalSubs = {};
+
   final Map<String, List<Uint8List?>> _recvChunks = {};
   final Map<String, Map<String, dynamic>> _recvMeta = {};
   final Map<String, String> _localFilePaths = {};
@@ -1182,17 +1226,49 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
         .child('presence')
         .onValue
         .listen((event) {
-      if (event.snapshot.value == null) return;
+      if (event.snapshot.value == null) {
+        // Everyone (including us, in theory) left presence — disconnect all peers.
+        for (var uid in _peerConns.keys.toList()) {
+          _disconnectFromPeer(uid);
+        }
+        _presentMembers = {};
+        if (mounted) setState(() {});
+        return;
+      }
       Map<dynamic, dynamic> map = event.snapshot.value as Map<dynamic, dynamic>;
       Set<String> present = map.keys.map((e) => e.toString()).where((u) => u != currentUid).toSet();
 
+      // Connect to newly-present peers.
       for (var uid in present) {
         if (!_presentMembers.contains(uid) && !_peerConns.containsKey(uid)) {
           _connectToPeer(uid);
         }
       }
+
+      // FIX: peers who left presence must be fully disconnected — otherwise their
+      // stale PeerConnection/DataChannel stays in _peerConns/_dataChannels with
+      // _channelReady still true, and file sends silently try to use a dead channel.
+      for (var uid in _peerConns.keys.toList()) {
+        if (!present.contains(uid)) {
+          _disconnectFromPeer(uid);
+        }
+      }
+
       _presentMembers = present;
+      if (mounted) setState(() {});
     });
+  }
+
+  void _disconnectFromPeer(String peerUid) {
+    for (var sub in _peerSignalSubs[peerUid] ?? const <StreamSubscription>[]) {
+      sub.cancel();
+    }
+    _peerSignalSubs.remove(peerUid);
+    _dataChannels[peerUid]?.close();
+    _dataChannels.remove(peerUid);
+    _peerConns[peerUid]?.close();
+    _peerConns.remove(peerUid);
+    _channelReady.remove(peerUid);
   }
 
   void _connectToPeer(String peerUid) async {
@@ -1203,6 +1279,7 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
     });
     _peerConns[peerUid] = conn;
     _channelReady[peerUid] = false;
+    _peerSignalSubs[peerUid] = [];
 
     List<String> pairIds = [currentUid, peerUid];
     pairIds.sort();
@@ -1237,19 +1314,23 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
       await conn.setLocalDescription(offer);
       await signalRef.child('offer').set({'sdp': offer.sdp, 'type': offer.type});
 
-      signalRef.child('answer').onValue.listen((event) async {
-        final data = event.snapshot.value as Map<dynamic, dynamic>?;
-        if (data != null && await conn.getRemoteDescription() == null) {
-          await conn.setRemoteDescription(RTCSessionDescription(data['sdp'], data['type']));
-        }
-      });
+      _peerSignalSubs[peerUid]!.add(
+        signalRef.child('answer').onValue.listen((event) async {
+          final data = event.snapshot.value as Map<dynamic, dynamic>?;
+          if (data != null && await conn.getRemoteDescription() == null) {
+            await conn.setRemoteDescription(RTCSessionDescription(data['sdp'], data['type']));
+          }
+        }),
+      );
 
-      signalRef.child('calleeCandidates').onChildAdded.listen((event) {
-        final data = event.snapshot.value as Map<dynamic, dynamic>?;
-        if (data != null) {
-          conn.addCandidate(RTCIceCandidate(data['candidate'], data['sdpMid'], data['sdpMLineIndex']));
-        }
-      });
+      _peerSignalSubs[peerUid]!.add(
+        signalRef.child('calleeCandidates').onChildAdded.listen((event) {
+          final data = event.snapshot.value as Map<dynamic, dynamic>?;
+          if (data != null) {
+            conn.addCandidate(RTCIceCandidate(data['candidate'], data['sdpMid'], data['sdpMLineIndex']));
+          }
+        }),
+      );
     } else {
       conn.onDataChannel = (channel) {
         _dataChannels[peerUid] = channel;
@@ -1263,22 +1344,26 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
         };
       };
 
-      signalRef.child('offer').onValue.listen((event) async {
-        final data = event.snapshot.value as Map<dynamic, dynamic>?;
-        if (data != null && await conn.getRemoteDescription() == null) {
-          await conn.setRemoteDescription(RTCSessionDescription(data['sdp'], data['type']));
-          RTCSessionDescription answer = await conn.createAnswer();
-          await conn.setLocalDescription(answer);
-          await signalRef.child('answer').set({'sdp': answer.sdp, 'type': answer.type});
-        }
-      });
+      _peerSignalSubs[peerUid]!.add(
+        signalRef.child('offer').onValue.listen((event) async {
+          final data = event.snapshot.value as Map<dynamic, dynamic>?;
+          if (data != null && await conn.getRemoteDescription() == null) {
+            await conn.setRemoteDescription(RTCSessionDescription(data['sdp'], data['type']));
+            RTCSessionDescription answer = await conn.createAnswer();
+            await conn.setLocalDescription(answer);
+            await signalRef.child('answer').set({'sdp': answer.sdp, 'type': answer.type});
+          }
+        }),
+      );
 
-      signalRef.child('callerCandidates').onChildAdded.listen((event) {
-        final data = event.snapshot.value as Map<dynamic, dynamic>?;
-        if (data != null) {
-          conn.addCandidate(RTCIceCandidate(data['candidate'], data['sdpMid'], data['sdpMLineIndex']));
-        }
-      });
+      _peerSignalSubs[peerUid]!.add(
+        signalRef.child('callerCandidates').onChildAdded.listen((event) {
+          final data = event.snapshot.value as Map<dynamic, dynamic>?;
+          if (data != null) {
+            conn.addCandidate(RTCIceCandidate(data['candidate'], data['sdpMid'], data['sdpMLineIndex']));
+          }
+        }),
+      );
     }
   }
 
@@ -1367,10 +1452,16 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
       String b64 = base64Encode(chunk);
       final chunkMsg = jsonEncode({'t': 'chunk', 'id': fileId, 'i': i, 'd': b64});
 
+      // FIX: wait for each peer's channel to drain before piling on more
+      // data instead of blasting chunks on a fixed 8ms timer regardless of
+      // how full the buffer already is.
       for (var entry in readyPeers) {
-        entry.value.send(RTCDataChannelMessage(chunkMsg));
+        await waitForChannelDrain(entry.value);
+        if (entry.value.state == RTCDataChannelState.RTCDataChannelOpen) {
+          entry.value.send(RTCDataChannelMessage(chunkMsg));
+        }
       }
-      await Future.delayed(const Duration(milliseconds: 8));
+      await Future.delayed(const Duration(milliseconds: 2));
     }
 
     final dir = await getApplicationDocumentsDirectory();
@@ -1757,8 +1848,9 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
   void dispose() {
     _presenceSub?.cancel();
     _dbRef.child('groups').child(widget.groupId).child('presence').child(currentUid).remove();
-    for (var conn in _peerConns.values) {
-      conn.close();
+    // FIX: cancel every signaling listener for every peer, not just close the connections.
+    for (var uid in _peerConns.keys.toList()) {
+      _disconnectFromPeer(uid);
     }
     _notifPlayer.dispose();
     super.dispose();
@@ -2013,6 +2105,8 @@ class _GroupCallScreenState extends State<GroupCallScreen> {
   final Map<String, MediaStream> _remoteStreams = {};
   final Map<String, RTCVideoRenderer> _remoteRenderers = {};
   final Map<String, String> _peerPhones = {};
+  // FIX: track signaling subscriptions per peer so they get cancelled on disconnect/dispose.
+  final Map<String, List<StreamSubscription>> _peerSignalSubs = {};
 
   StreamSubscription? _participantsSub;
   Set<String> _participants = {};
@@ -2087,6 +2181,7 @@ class _GroupCallScreenState extends State<GroupCallScreen> {
       ]
     });
     _peerConns[peerUid] = conn;
+    _peerSignalSubs[peerUid] = [];
 
     if (_localStream != null) {
       for (var track in _localStream!.getTracks()) {
@@ -2136,43 +2231,55 @@ class _GroupCallScreenState extends State<GroupCallScreen> {
       await conn.setLocalDescription(offer);
       await signalRef.child('offer').set({'sdp': offer.sdp, 'type': offer.type});
 
-      signalRef.child('answer').onValue.listen((event) async {
-        final data = event.snapshot.value as Map<dynamic, dynamic>?;
-        if (data != null && await conn.getRemoteDescription() == null) {
-          await conn.setRemoteDescription(RTCSessionDescription(data['sdp'], data['type']));
-        }
-      });
+      _peerSignalSubs[peerUid]!.add(
+        signalRef.child('answer').onValue.listen((event) async {
+          final data = event.snapshot.value as Map<dynamic, dynamic>?;
+          if (data != null && await conn.getRemoteDescription() == null) {
+            await conn.setRemoteDescription(RTCSessionDescription(data['sdp'], data['type']));
+          }
+        }),
+      );
 
-      signalRef.child('calleeCandidates').onChildAdded.listen((event) {
-        final data = event.snapshot.value as Map<dynamic, dynamic>?;
-        if (data != null) {
-          conn.addCandidate(RTCIceCandidate(data['candidate'], data['sdpMid'], data['sdpMLineIndex']));
-        }
-      });
+      _peerSignalSubs[peerUid]!.add(
+        signalRef.child('calleeCandidates').onChildAdded.listen((event) {
+          final data = event.snapshot.value as Map<dynamic, dynamic>?;
+          if (data != null) {
+            conn.addCandidate(RTCIceCandidate(data['candidate'], data['sdpMid'], data['sdpMLineIndex']));
+          }
+        }),
+      );
     } else {
-      signalRef.child('offer').onValue.listen((event) async {
-        final data = event.snapshot.value as Map<dynamic, dynamic>?;
-        if (data != null && await conn.getRemoteDescription() == null) {
-          await conn.setRemoteDescription(RTCSessionDescription(data['sdp'], data['type']));
-          RTCSessionDescription answer = await conn.createAnswer({
-            'offerToReceiveAudio': true,
-            'offerToReceiveVideo': widget.isVideo,
-          });
-          await conn.setLocalDescription(answer);
-          await signalRef.child('answer').set({'sdp': answer.sdp, 'type': answer.type});
-        }
-      });
+      _peerSignalSubs[peerUid]!.add(
+        signalRef.child('offer').onValue.listen((event) async {
+          final data = event.snapshot.value as Map<dynamic, dynamic>?;
+          if (data != null && await conn.getRemoteDescription() == null) {
+            await conn.setRemoteDescription(RTCSessionDescription(data['sdp'], data['type']));
+            RTCSessionDescription answer = await conn.createAnswer({
+              'offerToReceiveAudio': true,
+              'offerToReceiveVideo': widget.isVideo,
+            });
+            await conn.setLocalDescription(answer);
+            await signalRef.child('answer').set({'sdp': answer.sdp, 'type': answer.type});
+          }
+        }),
+      );
 
-      signalRef.child('callerCandidates').onChildAdded.listen((event) {
-        final data = event.snapshot.value as Map<dynamic, dynamic>?;
-        if (data != null) {
-          conn.addCandidate(RTCIceCandidate(data['candidate'], data['sdpMid'], data['sdpMLineIndex']));
-        }
-      });
+      _peerSignalSubs[peerUid]!.add(
+        signalRef.child('callerCandidates').onChildAdded.listen((event) {
+          final data = event.snapshot.value as Map<dynamic, dynamic>?;
+          if (data != null) {
+            conn.addCandidate(RTCIceCandidate(data['candidate'], data['sdpMid'], data['sdpMLineIndex']));
+          }
+        }),
+      );
     }
   }
 
   void _disconnectFromParticipant(String peerUid) {
+    for (var sub in _peerSignalSubs[peerUid] ?? const <StreamSubscription>[]) {
+      sub.cancel();
+    }
+    _peerSignalSubs.remove(peerUid);
     _peerConns[peerUid]?.close();
     _peerConns.remove(peerUid);
     _remoteRenderers[peerUid]?.dispose();
@@ -2239,6 +2346,13 @@ class _GroupCallScreenState extends State<GroupCallScreen> {
           .remove();
     }
 
+    _participantsSub?.cancel();
+    for (var uid in _peerConns.keys.toList()) {
+      for (var sub in _peerSignalSubs[uid] ?? const <StreamSubscription>[]) {
+        sub.cancel();
+      }
+    }
+    _peerSignalSubs.clear();
     for (var conn in _peerConns.values) {
       conn.close();
     }
@@ -2265,6 +2379,13 @@ class _GroupCallScreenState extends State<GroupCallScreen> {
           .child(currentUid)
           .remove();
     }
+    // FIX: cancel all per-peer signaling subscriptions, not just close connections.
+    for (var uid in _peerConns.keys.toList()) {
+      for (var sub in _peerSignalSubs[uid] ?? const <StreamSubscription>[]) {
+        sub.cancel();
+      }
+    }
+    _peerSignalSubs.clear();
     for (var conn in _peerConns.values) {
       conn.close();
     }
@@ -2934,6 +3055,13 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   bool _isRecording = false;
   String? _recordingPath;
 
+  // FIX: track every signaling-related subscription so dispose() can cancel them.
+  // Previously these kept firing (setRemoteDescription / addCandidate) on a
+  // PeerConnection that was already closed, throwing after the user left the chat.
+  final List<StreamSubscription> _signalSubs = [];
+  StreamSubscription? _messagesSub;
+  StreamSubscription? _typingSub;
+
   @override
   void initState() {
     super.initState();
@@ -2990,7 +3118,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   }
 
   void _listenForTyping() {
-    _dbRef
+    _typingSub = _dbRef
         .child('chats')
         .child(chatId)
         .child('typing')
@@ -3008,7 +3136,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   }
 
   void _listenForNewMessages() {
-    _dbRef.child('chats').child(chatId).child('messages').onValue.listen((event) {
+    _messagesSub = _dbRef.child('chats').child(chatId).child('messages').onValue.listen((event) {
       if (event.snapshot.value == null) return;
       Map<dynamic, dynamic> map = event.snapshot.value as Map<dynamic, dynamic>;
       int count = map.length;
@@ -3072,67 +3200,79 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       );
       _fileChannel!.onMessage = _handleDataChannelMessage;
       _fileChannel!.onDataChannelState = (state) {
-        setState(() {
-          _fileChannelReady = state == RTCDataChannelState.RTCDataChannelOpen;
-        });
+        if (mounted) {
+          setState(() {
+            _fileChannelReady = state == RTCDataChannelState.RTCDataChannelOpen;
+          });
+        }
       };
 
       RTCSessionDescription offer = await _fileConn!.createOffer();
       await _fileConn!.setLocalDescription(offer);
       await signalRef.child('offer').set({'sdp': offer.sdp, 'type': offer.type});
 
-      signalRef.child('answer').onValue.listen((event) async {
-        final data = event.snapshot.value as Map<dynamic, dynamic>?;
-        if (data != null && await _fileConn!.getRemoteDescription() == null) {
-          await _fileConn!.setRemoteDescription(
-            RTCSessionDescription(data['sdp'], data['type']),
-          );
-        }
-      });
+      _signalSubs.add(
+        signalRef.child('answer').onValue.listen((event) async {
+          final data = event.snapshot.value as Map<dynamic, dynamic>?;
+          if (data != null && _fileConn != null && await _fileConn!.getRemoteDescription() == null) {
+            await _fileConn!.setRemoteDescription(
+              RTCSessionDescription(data['sdp'], data['type']),
+            );
+          }
+        }),
+      );
 
-      signalRef.child('calleeCandidates').onChildAdded.listen((event) {
-        final data = event.snapshot.value as Map<dynamic, dynamic>?;
-        if (data != null) {
-          _fileConn!.addCandidate(RTCIceCandidate(
-            data['candidate'],
-            data['sdpMid'],
-            data['sdpMLineIndex'],
-          ));
-        }
-      });
+      _signalSubs.add(
+        signalRef.child('calleeCandidates').onChildAdded.listen((event) {
+          final data = event.snapshot.value as Map<dynamic, dynamic>?;
+          if (data != null && _fileConn != null) {
+            _fileConn!.addCandidate(RTCIceCandidate(
+              data['candidate'],
+              data['sdpMid'],
+              data['sdpMLineIndex'],
+            ));
+          }
+        }),
+      );
     } else {
       _fileConn!.onDataChannel = (RTCDataChannel channel) {
         _fileChannel = channel;
         _fileChannel!.onMessage = _handleDataChannelMessage;
         _fileChannel!.onDataChannelState = (state) {
-          setState(() {
-            _fileChannelReady = state == RTCDataChannelState.RTCDataChannelOpen;
-          });
+          if (mounted) {
+            setState(() {
+              _fileChannelReady = state == RTCDataChannelState.RTCDataChannelOpen;
+            });
+          }
         };
       };
 
-      signalRef.child('offer').onValue.listen((event) async {
-        final data = event.snapshot.value as Map<dynamic, dynamic>?;
-        if (data != null && await _fileConn!.getRemoteDescription() == null) {
-          await _fileConn!.setRemoteDescription(
-            RTCSessionDescription(data['sdp'], data['type']),
-          );
-          RTCSessionDescription answer = await _fileConn!.createAnswer();
-          await _fileConn!.setLocalDescription(answer);
-          await signalRef.child('answer').set({'sdp': answer.sdp, 'type': answer.type});
-        }
-      });
+      _signalSubs.add(
+        signalRef.child('offer').onValue.listen((event) async {
+          final data = event.snapshot.value as Map<dynamic, dynamic>?;
+          if (data != null && _fileConn != null && await _fileConn!.getRemoteDescription() == null) {
+            await _fileConn!.setRemoteDescription(
+              RTCSessionDescription(data['sdp'], data['type']),
+            );
+            RTCSessionDescription answer = await _fileConn!.createAnswer();
+            await _fileConn!.setLocalDescription(answer);
+            await signalRef.child('answer').set({'sdp': answer.sdp, 'type': answer.type});
+          }
+        }),
+      );
 
-      signalRef.child('callerCandidates').onChildAdded.listen((event) {
-        final data = event.snapshot.value as Map<dynamic, dynamic>?;
-        if (data != null) {
-          _fileConn!.addCandidate(RTCIceCandidate(
-            data['candidate'],
-            data['sdpMid'],
-            data['sdpMLineIndex'],
-          ));
-        }
-      });
+      _signalSubs.add(
+        signalRef.child('callerCandidates').onChildAdded.listen((event) {
+          final data = event.snapshot.value as Map<dynamic, dynamic>?;
+          if (data != null && _fileConn != null) {
+            _fileConn!.addCandidate(RTCIceCandidate(
+              data['candidate'],
+              data['sdpMid'],
+              data['sdpMLineIndex'],
+            ));
+          }
+        }),
+      );
     }
   }
 
@@ -3206,10 +3346,21 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     })));
 
     for (int i = 0; i < total; i++) {
+      // FIX: if the peer disconnects mid-transfer, stop instead of pushing
+      // the remaining chunks into a closed/closing channel.
+      if (_fileChannel == null ||
+          _fileChannel!.state != RTCDataChannelState.RTCDataChannelOpen) {
+        break;
+      }
+
       int start = i * chunkSize;
       int end = (start + chunkSize > bytes.length) ? bytes.length : start + chunkSize;
       Uint8List chunk = bytes.sublist(start, end);
       String b64 = base64Encode(chunk);
+
+      // FIX: backpressure - wait for the channel to drain instead of a
+      // fixed 5ms delay, so large files don't overflow the internal buffer.
+      await waitForChannelDrain(_fileChannel!);
 
       _fileChannel!.send(RTCDataChannelMessage(jsonEncode({
         't': 'chunk',
@@ -3218,7 +3369,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
         'd': b64,
       })));
 
-      await Future.delayed(const Duration(milliseconds: 5));
+      await Future.delayed(const Duration(milliseconds: 2));
     }
 
     final dir = await getApplicationDocumentsDirectory();
@@ -3465,6 +3616,9 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       'calleeId': widget.peerUid,
       'isVideo': isVideo,
       'status': 'ringing',
+      // FIX: needed so HomeScreen's incoming-call listener can tell fresh calls
+      // apart from stale/leftover "ringing" documents (e.g. after an app crash).
+      'timestamp': DateTime.now().millisecondsSinceEpoch,
     });
     if (!mounted) return;
     Navigator.push(
@@ -3672,6 +3826,14 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     _msgController.removeListener(_onTextChanged);
     _dbRef.child('chats').child(chatId).child('typing').child(currentUid).set(false);
     _notifPlayer.dispose();
+    // FIX: cancel all signaling/message/typing subscriptions before closing the
+    // connection so no listener callback runs against a disposed peer connection.
+    for (var sub in _signalSubs) {
+      sub.cancel();
+    }
+    _signalSubs.clear();
+    _messagesSub?.cancel();
+    _typingSub?.cancel();
     _fileChannel?.close();
     _fileConn?.close();
     _audioRecorder.dispose();
@@ -4141,7 +4303,7 @@ class _CallScreenState extends State<CallScreen> {
       _remoteCandidatesSub =
           signalRef.child('calleeCandidates').onChildAdded.listen((event) {
         final data = event.snapshot.value as Map<dynamic, dynamic>?;
-        if (data != null) {
+        if (data != null && _peerConn != null) {
           _peerConn!.addCandidate(RTCIceCandidate(
             data['candidate'],
             data['sdpMid'],
@@ -4196,7 +4358,7 @@ class _CallScreenState extends State<CallScreen> {
       _remoteCandidatesSub =
           signalRef.child('callerCandidates').onChildAdded.listen((event) {
         final data = event.snapshot.value as Map<dynamic, dynamic>?;
-        if (data != null) {
+        if (data != null && _peerConn != null) {
           _peerConn!.addCandidate(RTCIceCandidate(
             data['candidate'],
             data['sdpMid'],
